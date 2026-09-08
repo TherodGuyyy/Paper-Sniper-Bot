@@ -1,17 +1,44 @@
 import asyncio
 import logging
+import os
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import config
 import db
 import filters
 import position_manager
+import price_feed
 import telegram_sender
 import wallet_tracker
 from pumpportal_client import PumpPortalClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("main")
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Bare health-check endpoint so this can run as a Render free-tier Web
+    Service (which requires binding to $PORT) instead of a Background
+    Worker (which does not have a confirmed free tier — see README).
+    UptimeRobot pings this same way it pings bot_v5, to stop Render from
+    spinning it down after 15 min idle."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"paper sniper alive")
+
+    def log_message(self, format, *args):
+        pass  # don't spam Render logs with every health-check hit
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info(f"health check server listening on port {port}")
 
 
 async def on_new_token(new_token: dict):
@@ -48,7 +75,24 @@ async def on_account_trade(trade: dict):
     if not trade.get("v_sol") or not trade.get("v_tokens"):
         log.info(f"[og_wallet skip] {mint}: no reserve data on this trade event")
         return
-    await position_manager.attempt_og_snipe(mint, trade["v_sol"], trade["v_tokens"], label)
+    await position_manager.attempt_og_snipe(mint, trade["v_sol"], trade["v_tokens"], wallet, label)
+
+
+async def on_connection_status(reconnect=False, failing=False, error=None):
+    if failing:
+        await telegram_sender.send(
+            f"⚠️ Paper sniper is struggling to connect to PumpPortal (3+ failed attempts). "
+            f"Last error: {error}\nStill retrying automatically."
+        )
+    elif reconnect:
+        await telegram_sender.send("🔄 Paper sniper reconnected after a dropped connection.")
+    else:
+        await telegram_sender.send(
+            "✅ Paper sniper is LIVE — connected to PumpPortal and watching launches.\n"
+            f"Launch snipe: {'ON' if config.LAUNCH_SNIPE_ENABLED else 'off'} | "
+            f"OG wallet snipe: {'ON' if config.OG_WALLET_SNIPE_ENABLED else 'off'} | "
+            f"Watching {len(config.WATCHED_WALLETS)} wallet(s)."
+        )
 
 
 async def daily_summary_loop():
@@ -68,28 +112,25 @@ async def successor_check_loop():
 
 
 async def main():
+    start_health_server()
     db.init_db()
     wallet_tracker.load_watchlist_into_config()
 
     global ppclient
-    ppclient = PumpPortalClient(on_new_token, on_token_trade, on_account_trade)
+    ppclient = PumpPortalClient(on_new_token, on_token_trade, on_account_trade, on_connected=on_connection_status)
 
     for label, addr in config.WATCHED_WALLETS.items():
         await ppclient.subscribe_account(addr)
         log.info(f"watching wallet {label}: {addr}")
 
-    await telegram_sender.send(
-        "🚀 Paper sniper started.\n"
-        f"Launch snipe: {'ON' if config.LAUNCH_SNIPE_ENABLED else 'off'} | "
-        f"OG wallet snipe: {'ON' if config.OG_WALLET_SNIPE_ENABLED else 'off'} | "
-        f"Watching {len(config.WATCHED_WALLETS)} wallet(s)."
-    )
+    await position_manager.reconcile_open_positions(ppclient)
 
     await asyncio.gather(
         ppclient.run_forever(),
         position_manager.sweep_time_exits(ppclient),
         daily_summary_loop(),
         successor_check_loop(),
+        price_feed.refresh_loop(),
     )
 
 

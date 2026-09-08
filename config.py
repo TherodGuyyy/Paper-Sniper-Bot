@@ -42,12 +42,17 @@ MAX_SLIPPAGE_PCT = 0.15         # if real price impact by the time our buy lands
 # Entry filters — a launch must pass ALL of these to be paper-bought
 FILTER_MIN_INITIAL_BUY_SOL = 0.5     # dev's own opening buy, too small often = no conviction/instant abandon
 FILTER_MAX_CREATOR_PRIOR_TOKENS = 15  # skip serial launchers with a huge past token count (serial ruggers / spam)
-FILTER_REQUIRE_CREATOR_HISTORY_CHECK = True  # set False if Helius calls are too slow/unreliable and you want speed over filtering
+FILTER_REQUIRE_CREATOR_HISTORY_CHECK = True  # set False if Helius calls are too slow/unreliable and you want speed over filtering, or to save Helius credits
 
-# Exit logic (Strategy A)
-TAKE_PROFIT_PCT = 0.80     # close at +80%
-STOP_LOSS_PCT = 0.35       # close at -35%
-MAX_HOLD_SECONDS = 900     # force-exit after 15 minutes regardless of P&L — most real moves on new launches happen fast or not at all
+# Exit logic (Strategy A) — multiple-based, with a scale-out:
+# at TP1_MULTIPLE (price = entry * multiple), sell TP1_SELL_FRACTION of the
+# position and let the rest ride toward TP2_MULTIPLE. If price never gets
+# there, stop-loss or the time exit still protects the remainder.
+TP1_MULTIPLE = 2.5          # e.g. 2.5 = exit partial at +150%
+TP1_SELL_FRACTION = 0.5     # sell half at TP1, let the other half ride
+TP2_MULTIPLE = 3.0          # remaining position exits fully here if reached
+STOP_LOSS_PCT = 0.35        # applies to the REMAINING position at any point
+MAX_HOLD_SECONDS = 900      # force-exit remaining position after 15 minutes regardless of P&L
 
 # ---------------------------------------------------------------------------
 # STRATEGY B — OG-token revival: buy when a watched wallet buys a dormant
@@ -65,9 +70,11 @@ OG_BUY_SIZE_SOL = 0.03
 DORMANT_MIN_TOKEN_AGE_HOURS = 24
 DORMANT_MIN_QUIET_HOURS = 6
 
-# Exit logic (Strategy B) — OG revival plays tend to run longer than fresh
-# launches, so looser/slower exits than Strategy A
-OG_TAKE_PROFIT_PCT = 1.00
+# Exit logic (Strategy B) — same scale-out shape as Strategy A but tuned
+# looser, since OG revival plays tend to run longer than fresh launches
+OG_TP1_MULTIPLE = 2.0
+OG_TP1_SELL_FRACTION = 0.5
+OG_TP2_MULTIPLE = 3.0
 OG_STOP_LOSS_PCT = 0.40
 OG_MAX_HOLD_SECONDS = 3600
 
@@ -81,6 +88,18 @@ WATCHED_WALLETS = {
 # recent outgoing SOL transfers for a likely successor wallet and auto-add it
 WALLET_QUIET_DAYS_BEFORE_SUCCESSOR_CHECK = 4
 SUCCESSOR_MIN_TRANSFER_SOL = 0.05  # ignore dust transfers when guessing the successor
+
+# ---------------------------------------------------------------------------
+# Display / bankroll
+# ---------------------------------------------------------------------------
+# A starting paper bankroll purely for display purposes — running balance
+# shown in Telegram alerts and the daily summary is STARTING_BALANCE_SOL +
+# sum of all closed trades' pnl_sol. Real trades never touch this, it's just
+# so the numbers read like a real account instead of isolated trade tickets.
+STARTING_BALANCE_SOL = 5.0
+
+SHOW_USD = True  # show a $ estimate alongside SOL amounts, using a cached SOL/USD price
+SOL_PRICE_REFRESH_SECONDS = 300  # how often to refresh the cached SOL/USD price
 
 # ---------------------------------------------------------------------------
 # Persistence / reporting

@@ -58,22 +58,26 @@ class PumpPortalClient:
     events to async callback functions.
     """
 
-    def __init__(self, on_new_token, on_token_trade, on_account_trade):
+    def __init__(self, on_new_token, on_token_trade, on_account_trade, on_connected=None):
         self.on_new_token = on_new_token
         self.on_token_trade = on_token_trade
         self.on_account_trade = on_account_trade
+        self.on_connected = on_connected
         self._ws = None
         self._subscribed_mints = set()
         self._subscribed_accounts = set()
         self._raw_logged = {"newToken": 0, "trade": 0}
+        self._ever_connected = False
 
     async def run_forever(self):
         backoff = 1
+        consecutive_failures = 0
         while True:
             try:
                 async with websockets.connect(config.PUMPPORTAL_WS_URL, ping_interval=20) as ws:
                     self._ws = ws
                     backoff = 1
+                    consecutive_failures = 0
                     await self._subscribe_new_tokens()
                     # re-subscribe anything added while disconnected
                     for m in list(self._subscribed_mints):
@@ -81,10 +85,19 @@ class PumpPortalClient:
                     for a in list(self._subscribed_accounts):
                         await self._send({"method": "subscribeAccountTrade", "keys": [a]})
 
+                    if not self._ever_connected and self.on_connected:
+                        self._ever_connected = True
+                        await self.on_connected(reconnect=False)
+                    elif self._ever_connected and self.on_connected:
+                        await self.on_connected(reconnect=True)
+
                     async for raw in ws:
                         await self._handle_message(raw)
             except Exception as e:
+                consecutive_failures += 1
                 log.warning(f"pumpportal ws disconnected ({e}), reconnecting in {backoff}s")
+                if consecutive_failures == 3 and self.on_connected:
+                    await self.on_connected(reconnect=False, failing=True, error=str(e))
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 
