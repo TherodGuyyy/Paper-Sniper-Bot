@@ -29,6 +29,14 @@ _reserve_cache: dict[str, tuple[float, float]] = {}
 # mint -> in-memory open position record
 _open_positions: dict[str, dict] = {}
 
+# mint -> set of trader addresses seen buying during the pending latency
+# window, used for the fast early-buyer-interest check
+_pending_buyers: dict[str, set] = {}
+
+
+def count_open(strategy: str) -> int:
+    return len([p for p in _open_positions.values() if p["strategy"] == strategy])
+
 
 def update_reserve_cache(mint: str, v_sol: float, v_tokens: float):
     if v_sol and v_tokens:
@@ -63,6 +71,7 @@ async def reconcile_open_positions(ppclient):
             "tp1_done": bool(r["tp1_done"]),
             "realized_pnl_sol": r["realized_pnl_sol"] or 0,
             "triggered_by_wallet": r["triggered_by_wallet"],
+            "baseline_reserves": None,  # not persisted — dead-token early exit just won't apply to reconciled positions, max_hold still will
         }
         await ppclient.subscribe_mint_trades(mint)
     if rows:
@@ -71,11 +80,19 @@ async def reconcile_open_positions(ppclient):
 
 async def attempt_launch_snipe(new_token: dict, ppclient):
     mint = new_token["mint"]
+    creator = new_token.get("creator")
     update_reserve_cache(mint, new_token.get("v_sol"), new_token.get("v_tokens"))
     await ppclient.subscribe_mint_trades(mint)
+    _pending_buyers[mint] = set()
 
     latency_ms = random.uniform(config.SIMULATED_LATENCY_MS_MIN, config.SIMULATED_LATENCY_MS_MAX)
     await asyncio.sleep(latency_ms / 1000)
+
+    early_buyers = _pending_buyers.pop(mint, set()) - {creator}
+    if len(early_buyers) < config.FILTER_MIN_EARLY_BUYERS:
+        db.log_missed("launch", mint, f"only {len(early_buyers)} other buyer(s) seen in latency window, below FILTER_MIN_EARLY_BUYERS")
+        await ppclient.unsubscribe_mint_trades(mint)
+        return
 
     reserves = get_latest_reserves(mint)
     if not reserves:
@@ -114,6 +131,7 @@ async def attempt_launch_snipe(new_token: dict, ppclient):
         "tp1_multiple": config.TP1_MULTIPLE, "tp1_sell_fraction": config.TP1_SELL_FRACTION,
         "tp2_multiple": config.TP2_MULTIPLE, "sl_pct": config.STOP_LOSS_PCT, "max_hold": config.MAX_HOLD_SECONDS,
         "tp1_done": False, "realized_pnl_sol": 0.0, "triggered_by_wallet": None,
+        "baseline_reserves": (v_sol, v_tokens),
     }
     log.info(f"[OPEN launch] {mint} entry_price={fill.effective_price:.10f} impact={fill.price_impact_pct:.1%}")
     await telegram_sender.send_trade_open_alert("launch", mint, fill.effective_price, config.LAUNCH_BUY_SIZE_SOL)
@@ -149,6 +167,7 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
         "tp1_multiple": config.OG_TP1_MULTIPLE, "tp1_sell_fraction": config.OG_TP1_SELL_FRACTION,
         "tp2_multiple": config.OG_TP2_MULTIPLE, "sl_pct": config.OG_STOP_LOSS_PCT, "max_hold": config.OG_MAX_HOLD_SECONDS,
         "tp1_done": False, "realized_pnl_sol": 0.0, "triggered_by_wallet": wallet_addr,
+        "baseline_reserves": (v_sol, v_tokens),
     }
     log.info(f"[OPEN og_wallet] {mint} triggered_by={watched_wallet_label} entry_price={fill.effective_price:.10f}")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, fill.effective_price, config.OG_BUY_SIZE_SOL)
@@ -205,6 +224,9 @@ async def on_trade_event(trade: dict, ppclient):
     if trade.get("v_sol") and trade.get("v_tokens"):
         update_reserve_cache(mint, trade["v_sol"], trade["v_tokens"])
 
+    if mint in _pending_buyers and trade.get("tx_type") == "buy" and trade.get("trader"):
+        _pending_buyers[mint].add(trade["trader"])
+
     pos = _open_positions.get(mint)
     if not pos:
         return
@@ -231,7 +253,19 @@ async def sweep_time_exits(ppclient):
         now = time.time()
         for mint in list(_open_positions.keys()):
             pos = _open_positions[mint]
-            if now - pos["entry_time"] >= pos["max_hold"]:
-                reserves = get_latest_reserves(mint)
+            elapsed = now - pos["entry_time"]
+            reserves = get_latest_reserves(mint)
+
+            if elapsed >= pos["max_hold"]:
                 if reserves:
                     await _close(mint, pos, reserves[0], reserves[1], "time_exit", ppclient)
+                continue
+
+            baseline = pos.get("baseline_reserves")
+            if (
+                baseline
+                and elapsed >= config.DEAD_TOKEN_EXIT_SECONDS
+                and not pos["tp1_done"]
+                and reserves == baseline
+            ):
+                await _close(mint, pos, reserves[0], reserves[1], "dead_token_exit", ppclient)

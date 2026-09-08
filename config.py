@@ -23,6 +23,13 @@ LAUNCH_SNIPE_ENABLED = True
 # slippage/fees correctly)
 LAUNCH_BUY_SIZE_SOL = 0.05
 
+# Hard cap on how many launch positions can be open at once. This is the
+# main defense against alert flooding — pump.fun produces far more launches
+# per minute than any filter alone will meaningfully cut down, so once
+# you're holding this many, new candidates are skipped until one closes.
+MAX_CONCURRENT_LAUNCH_POSITIONS = 8
+MAX_CONCURRENT_OG_POSITIONS = 5
+
 # Simulated latency: time between "we saw the launch event" and "our buy
 # transaction would land on-chain", in milliseconds. This is NOT a guess —
 # during this window we let real subsequent trades from other wallets happen
@@ -40,9 +47,10 @@ PRIORITY_FEE_SOL_MAX = 0.006
 MAX_SLIPPAGE_PCT = 0.15         # if real price impact by the time our buy lands exceeds this, the trade is marked MISSED, not filled — this is what actually kills naive snipers
 
 # Entry filters — a launch must pass ALL of these to be paper-bought
-FILTER_MIN_INITIAL_BUY_SOL = 0.5     # dev's own opening buy, too small often = no conviction/instant abandon
+FILTER_MIN_INITIAL_BUY_SOL = 2.0      # RAISED from 0.5 — that let through almost every launch. This is a much stronger conviction bar.
 FILTER_MAX_CREATOR_PRIOR_TOKENS = 15  # skip serial launchers with a huge past token count (serial ruggers / spam)
 FILTER_REQUIRE_CREATOR_HISTORY_CHECK = True  # set False if Helius calls are too slow/unreliable and you want speed over filtering, or to save Helius credits
+FILTER_MIN_EARLY_BUYERS = 1  # NEW — during the simulated-latency wait we're already doing, require at least this many OTHER wallets (not the creator) to also buy before we finalize the entry. Costs zero extra time since we're waiting anyway; filters out tokens nobody but the dev has touched.
 
 # Exit logic (Strategy A) — multiple-based, with a scale-out:
 # at TP1_MULTIPLE (price = entry * multiple), sell TP1_SELL_FRACTION of the
@@ -53,6 +61,7 @@ TP1_SELL_FRACTION = 0.5     # sell half at TP1, let the other half ride
 TP2_MULTIPLE = 3.0          # remaining position exits fully here if reached
 STOP_LOSS_PCT = 0.35        # applies to the REMAINING position at any point
 MAX_HOLD_SECONDS = 900      # force-exit remaining position after 15 minutes regardless of P&L
+DEAD_TOKEN_EXIT_SECONDS = 90  # NEW — if a position has seen ZERO trade activity since entry (common — most launches get no volume at all) for this long, close it early instead of occupying a slot for the full 15 minutes doing nothing
 
 # ---------------------------------------------------------------------------
 # STRATEGY B — OG-token revival: buy when a watched wallet buys a dormant

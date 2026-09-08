@@ -46,6 +46,9 @@ async def on_new_token(new_token: dict):
 
     if not config.LAUNCH_SNIPE_ENABLED:
         return
+    if position_manager.count_open("launch") >= config.MAX_CONCURRENT_LAUNCH_POSITIONS:
+        db.log_missed("launch", new_token["mint"], "at MAX_CONCURRENT_LAUNCH_POSITIONS cap")
+        return
     ok, reason = await filters.run_all_filters(new_token)
     if not ok:
         db.log_missed("launch", new_token["mint"], f"filtered: {reason}")
@@ -66,6 +69,8 @@ async def on_account_trade(trade: dict):
     label = next((lbl for lbl, addr in config.WATCHED_WALLETS.items() if addr == wallet), wallet[:8])
 
     if trade.get("tx_type") != "buy":
+        return
+    if position_manager.count_open("og_wallet") >= config.MAX_CONCURRENT_OG_POSITIONS:
         return
     mint = trade["mint"]
     dormant, reason = wallet_tracker.is_dormant_enough(mint)
