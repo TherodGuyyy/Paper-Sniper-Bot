@@ -10,6 +10,7 @@ import db
 import filters
 import position_manager
 import price_feed
+import telegram_commands
 import telegram_sender
 import wallet_tracker
 from pumpportal_client import PumpPortalClient
@@ -136,6 +137,7 @@ async def main():
         daily_summary_loop(),
         successor_check_loop(),
         price_feed.refresh_loop(),
+        telegram_commands.poll_commands(),
     )
 
 

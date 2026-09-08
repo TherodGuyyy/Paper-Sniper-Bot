@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS wallet_performance (
     total_pnl_sol REAL DEFAULT 0,
     last_updated REAL
 );
+
+-- Small generic key/value store for things like a manual balance
+-- adjustment set via a Telegram command
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value REAL
+);
 """
 
 
@@ -151,7 +158,25 @@ def get_stats_since(since_ts):
 def get_current_balance_sol():
     with get_conn() as conn:
         row = conn.execute("SELECT COALESCE(SUM(pnl_sol), 0) s FROM trades WHERE status='closed'").fetchone()
-        return config.STARTING_BALANCE_SOL + (row["s"] or 0)
+        adj_row = conn.execute("SELECT value FROM settings WHERE key='manual_adjustment_sol'").fetchone()
+        adjustment = adj_row["value"] if adj_row else 0.0
+        return config.STARTING_BALANCE_SOL + (row["s"] or 0) + adjustment
+
+
+def add_manual_balance_adjustment(delta_sol: float):
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key='manual_adjustment_sol'").fetchone()
+        current = row["value"] if row else 0.0
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('manual_adjustment_sol', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (current + delta_sol,),
+        )
+
+
+def clear_manual_balance_adjustment():
+    with get_conn() as conn:
+        conn.execute("DELETE FROM settings WHERE key='manual_adjustment_sol'")
 
 
 def upsert_watchlist(wallet, label="", successor_of=None):
