@@ -50,7 +50,13 @@ MAX_SLIPPAGE_PCT = 0.15         # if real price impact by the time our buy lands
 FILTER_MIN_INITIAL_BUY_SOL = 2.0      # RAISED from 0.5 — that let through almost every launch. This is a much stronger conviction bar.
 FILTER_MAX_CREATOR_PRIOR_TOKENS = 15  # skip serial launchers with a huge past token count (serial ruggers / spam)
 FILTER_REQUIRE_CREATOR_HISTORY_CHECK = True  # set False if Helius calls are too slow/unreliable and you want speed over filtering, or to save Helius credits
-FILTER_MIN_EARLY_BUYERS = 0  # DISABLED after testing — requiring another buyer within the ~400-900ms latency window rejected almost everything, since real follow-on buying rarely happens that fast. Kept in the code in case you want to re-enable it later with a longer dedicated observation window (that would trade off against execution-speed realism, see position_manager.py).
+
+# --- rug-pattern filters below: both are FREE (zero extra API calls, zero extra latency) — they use data already in the launch/trade events we're already receiving ---
+
+PUMPFUN_TOTAL_SUPPLY = 1_000_000_000  # standard fixed supply for every pump.fun token — VERIFY this against a live raw sample if a launch's math looks off
+FILTER_MAX_CREATOR_SUPPLY_PCT = 0.15  # reject if the creator's own opening buy already gives them more than this share of total supply — a real, instant rug-risk signal (heavy dev allocation = they can crash the price alone), computed for free from the create event itself
+
+FILTER_BUNDLE_MAX_OTHER_BUYERS = 1  # if MORE than this many other wallets buy within the same short latency window, treat it as a suspected coordinated bundle (a bundler launching many wallets in the same slot) rather than organic interest, and reject. Note this replaced an earlier MIN-buyers filter that required at least 1 other buyer as a positive signal — that direction was backwards: genuine organic follow-on buying that fast is rare, so seeing SEVERAL buyers that fast is actually more indicative of a bundle than of real interest.
 
 # Exit logic (Strategy A) — multiple-based, with a scale-out:
 # at TP1_MULTIPLE (price = entry * multiple), sell TP1_SELL_FRACTION of the

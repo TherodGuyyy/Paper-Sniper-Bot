@@ -89,8 +89,8 @@ async def attempt_launch_snipe(new_token: dict, ppclient):
     await asyncio.sleep(latency_ms / 1000)
 
     early_buyers = _pending_buyers.pop(mint, set()) - {creator}
-    if len(early_buyers) < config.FILTER_MIN_EARLY_BUYERS:
-        db.log_missed("launch", mint, f"only {len(early_buyers)} other buyer(s) seen in latency window, below FILTER_MIN_EARLY_BUYERS")
+    if len(early_buyers) > config.FILTER_BUNDLE_MAX_OTHER_BUYERS:
+        db.log_missed("launch", mint, f"suspected bundle: {len(early_buyers)} other buyer(s) landed within the latency window")
         await ppclient.unsubscribe_mint_trades(mint)
         return
 

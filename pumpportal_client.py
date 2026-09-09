@@ -30,6 +30,7 @@ def parse_new_token(msg: dict) -> dict:
         "name": msg.get("name"),
         "symbol": msg.get("symbol"),
         "initial_buy_sol": msg.get("solAmount", 0.0),
+        "initial_buy_tokens": msg.get("initialBuy", 0.0),
         "v_sol": msg.get("vSolInBondingCurve"),
         "v_tokens": msg.get("vTokensInBondingCurve"),
         "market_cap_sol": msg.get("marketCapSol"),

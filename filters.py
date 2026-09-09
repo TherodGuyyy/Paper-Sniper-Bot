@@ -27,6 +27,12 @@ def basic_launch_filters(new_token: dict) -> tuple[bool, str]:
         return False, "missing mint"
     if (new_token.get("initial_buy_sol") or 0) < config.FILTER_MIN_INITIAL_BUY_SOL:
         return False, f"initial buy {new_token.get('initial_buy_sol')} SOL below minimum"
+
+    creator_tokens = new_token.get("initial_buy_tokens") or 0
+    creator_pct = creator_tokens / config.PUMPFUN_TOTAL_SUPPLY
+    if creator_pct > config.FILTER_MAX_CREATOR_SUPPLY_PCT:
+        return False, f"creator holds {creator_pct:.1%} of supply from opening buy alone, over {config.FILTER_MAX_CREATOR_SUPPLY_PCT:.0%} limit"
+
     return True, "ok"
 
 
