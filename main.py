@@ -24,12 +24,18 @@ class _HealthHandler(BaseHTTPRequestHandler):
     Service (which requires binding to $PORT) instead of a Background
     Worker (which does not have a confirmed free tier — see README).
     UptimeRobot pings this same way it pings bot_v5, to stop Render from
-    spinning it down after 15 min idle."""
+    spinning it down after 15 min idle. Handles both GET and HEAD — UptimeRobot's
+    default HTTP(s) monitor uses HEAD, and Python's http.server returns
+    501 Not Implemented for any method without an explicit handler."""
 
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"paper sniper alive")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
     def log_message(self, format, *args):
         pass  # don't spam Render logs with every health-check hit
