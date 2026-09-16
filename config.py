@@ -17,7 +17,7 @@ PUMPPORTAL_WS_URL = "wss://pumpportal.fun/api/data"
 # ---------------------------------------------------------------------------
 # STRATEGY A — new-launch sniping with filters
 # ---------------------------------------------------------------------------
-LAUNCH_SNIPE_ENABLED = True
+LAUNCH_SNIPE_ENABLED = False  # TURNED OFF after real testing showed negative P&L — pivoting to wallet-copy strategy (Strategy B) instead. Kept in the code in case you want to revisit it later, e.g. combined with the discovery feature below.
 
 # Position sizing (paper — no real SOL moves, but must be realistic to size
 # slippage/fees correctly)
@@ -85,24 +85,70 @@ OG_BUY_SIZE_SOL = 0.03
 DORMANT_MIN_TOKEN_AGE_HOURS = 24
 DORMANT_MIN_QUIET_HOURS = 6
 
-# Exit logic (Strategy B) — same scale-out shape as Strategy A but tuned
-# looser, since OG revival plays tend to run longer than fresh launches
-OG_TP1_MULTIPLE = 2.0
+# Exit logic (Strategy B) — DEFAULTS used only when a watched wallet has no
+# entry in WALLET_EXIT_OVERRIDES below. With two very different real traders
+# now in play (a rare, big-move guy vs. a daily high-frequency one), one
+# shared exit shape doesn't fit both — set per-wallet overrides instead.
+OG_TP1_MULTIPLE = 1.5
 OG_TP1_SELL_FRACTION = 0.5
-OG_TP2_MULTIPLE = 3.0
-OG_STOP_LOSS_PCT = 0.40
-OG_MAX_HOLD_SECONDS = 3600
+OG_TP2_MULTIPLE = 2.0
+OG_STOP_LOSS_PCT = 0.30
+OG_MAX_HOLD_SECONDS = 900
 
-# Wallets to watch for OG-token buys. Starts empty on purpose — add wallets
-# you've identified (see smart-wallet-finder project). Format: {"label": "addr"}
+# Per-wallet exit overrides, keyed by wallet address. Any key you don't set
+# for a wallet falls back to the OG_* defaults above.
+WALLET_EXIT_OVERRIDES = {
+    # "7pm guy" — buys real conviction plays at ~300-500 mc that move fast,
+    # but only does this once every 2-3 days now (the rest of the time he's
+    # quiet). Real prior trading history showed 1.3-1.5x typical, sometimes
+    # 2x actually captured (well below the token's theoretical move, since
+    # slippage/timing eats most of a naive "buy at 300mc, sell at 2k mc"
+    # fantasy return) — targets set to match REAL captured outcomes, not
+    # the token's theoretical ceiling.
+    "2YBHj8kf7AMgwhMKfMUxsyBk9UuX87FUq7UFFQDL9Atq": {
+        "tp1_multiple": 1.4, "tp1_sell_fraction": 0.5, "tp2_multiple": 2.0,
+        "sl_pct": 0.30, "max_hold_seconds": 900,
+    },
+    # Meme Detective — trades daily, farms a lot (many low-quality buys),
+    # occasionally shills a real mover on Twitter. Until we have a way to
+    # tell his farm buys from real ones (see WATCHED_WALLETS comment below),
+    # the plan is: copy everything, very fast in/out, smaller size, tighter
+    # stop — treat every trade as probably-a-farm until proven otherwise,
+    # so a single bad one can't do much damage.
+    # "<MEME_DETECTIVE_WALLET_ADDRESS_HERE>": {
+    #     "tp1_multiple": 1.3, "tp1_sell_fraction": 0.6, "tp2_multiple": 1.8,
+    #     "sl_pct": 0.20, "max_hold_seconds": 300,
+    # },
+}
+
+# Wallets to watch for OG-token buys. Format: {"label": "address"}.
+# NOTE: Meme Detective's address isn't in here yet — add it once you have it
+# (and uncomment his WALLET_EXIT_OVERRIDES entry above).
 WATCHED_WALLETS = {
-    # "example_label": "2YBHj8kf7AMgwhMKfMUxsyBk9UuX87FUq7UFFQDL9Atq",
+    "seven_pm_guy": "2YBHj8kf7AMgwhMKfMUxsyBk9UuX87FUq7UFFQDL9Atq",
 }
 
 # Wallet-hopping: if a watched wallet goes quiet for this long, check its
 # recent outgoing SOL transfers for a likely successor wallet and auto-add it
 WALLET_QUIET_DAYS_BEFORE_SUCCESSOR_CHECK = 4
 SUCCESSOR_MIN_TRANSFER_SOL = 0.05  # ignore dust transfers when guessing the successor
+
+# ---------------------------------------------------------------------------
+# DISCOVERY — passively watch ALL new launches (not just ones being traded)
+# for wallets that keep showing up as early buyers on tokens that go on to
+# pump. This is separate from Strategy A (which actually buys); discovery
+# never trades, it only watches and reports. When a wallet reappears as an
+# early buyer on enough separate winners, you get a Telegram alert with the
+# address so you can review and decide whether to add it to WATCHED_WALLETS
+# yourself — nothing is auto-added.
+# ---------------------------------------------------------------------------
+DISCOVERY_ENABLED = True
+
+MAX_CONCURRENT_DISCOVERY_WATCHES = 40  # cap on how many tokens we watch at once, purely to bound resource/subscription usage — this is a sample, not full coverage, and that's fine
+DISCOVERY_EARLY_BUYER_WINDOW_SECONDS = 30  # a buy counts as "early" if it lands within this long of the token's creation
+DISCOVERY_WINDOW_SECONDS = 600         # how long we watch a token before judging it a winner or not
+DISCOVERY_SUCCESS_MULTIPLE = 3.0       # a token counts as a "winner" if price is at least this many times its launch price by the end of the window
+DISCOVERY_MIN_APPEARANCES = 2          # a wallet needs to show up as an early buyer on at least this many separate winners before we alert you about it
 
 # ---------------------------------------------------------------------------
 # Display / bankroll

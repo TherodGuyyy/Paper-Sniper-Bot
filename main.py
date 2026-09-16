@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import config
 import db
+import discovery
 import filters
 import position_manager
 import price_feed
@@ -50,6 +51,7 @@ def start_health_server():
 
 async def on_new_token(new_token: dict):
     wallet_tracker.record_new_token_seen(new_token["mint"])
+    await discovery.start_watch(new_token, ppclient)
 
     if not config.LAUNCH_SNIPE_ENABLED:
         return
@@ -65,6 +67,7 @@ async def on_new_token(new_token: dict):
 
 async def on_token_trade(trade: dict):
     await position_manager.on_trade_event(trade, ppclient)
+    await discovery.on_trade(trade)
 
 
 async def on_account_trade(trade: dict):
@@ -144,6 +147,7 @@ async def main():
         successor_check_loop(),
         price_feed.refresh_loop(),
         telegram_commands.poll_commands(),
+        discovery.sweep(ppclient),
     )
 
 

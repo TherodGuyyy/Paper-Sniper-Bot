@@ -66,6 +66,18 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value REAL
 );
+
+-- Passive discovery: candidate wallets found by watching ALL launches (not
+-- just ones we trade) for wallets that keep buying early into winners.
+-- Nothing here gets auto-traded — this is a review list for the user.
+CREATE TABLE IF NOT EXISTS wallet_discovery (
+    wallet TEXT PRIMARY KEY,
+    appearance_count INTEGER DEFAULT 0,
+    mints_json TEXT DEFAULT '[]',
+    first_seen REAL,
+    last_seen REAL,
+    alerted INTEGER DEFAULT 0
+);
 """
 
 
@@ -222,5 +234,48 @@ def get_wallet_performance():
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM wallet_performance ORDER BY total_pnl_sol DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def record_discovery_appearance(wallet: str, mint: str) -> int:
+    """Call when a wallet is seen as an early buyer on a token that hit the
+    discovery success threshold. Returns the new appearance_count."""
+    import json
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM wallet_discovery WHERE wallet=?", (wallet,)).fetchone()
+        if row:
+            mints = json.loads(row["mints_json"] or "[]")
+            mints = (mints + [mint])[-5:]  # keep last 5 examples
+            new_count = row["appearance_count"] + 1
+            conn.execute(
+                "UPDATE wallet_discovery SET appearance_count=?, mints_json=?, last_seen=? WHERE wallet=?",
+                (new_count, json.dumps(mints), time.time(), wallet),
+            )
+            return new_count
+        else:
+            conn.execute(
+                "INSERT INTO wallet_discovery (wallet, appearance_count, mints_json, first_seen, last_seen, alerted) "
+                "VALUES (?, 1, ?, ?, ?, 0)",
+                (wallet, json.dumps([mint]), time.time(), time.time()),
+            )
+            return 1
+
+
+def get_discovery_wallet(wallet: str):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM wallet_discovery WHERE wallet=?", (wallet,)).fetchone()
+        return dict(row) if row else None
+
+
+def mark_discovery_alerted(wallet: str):
+    with get_conn() as conn:
+        conn.execute("UPDATE wallet_discovery SET alerted=1 WHERE wallet=?", (wallet,))
+
+
+def get_discovery_candidates():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM wallet_discovery ORDER BY appearance_count DESC"
         ).fetchall()
         return [dict(r) for r in rows]

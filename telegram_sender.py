@@ -88,3 +88,13 @@ async def send_partial_exit_alert(strategy, mint, fraction, realized_sol):
 async def send_trade_close_alert(strategy, mint, reason, pnl_sol, pnl_pct):
     emoji = "✅" if pnl_sol and pnl_sol > 0 else "🔴"
     await send(f"{emoji} CLOSE [{strategy}] {mint}\nreason: {reason}\npnl: {price_feed.fmt_usd(pnl_sol)} ({pnl_pct:+.1%})\n{_bal_line()}\n{_open_line()}")
+
+
+async def send_discovery_alert(wallet: str, appearance_count: int, mints_json: str):
+    await send(
+        f"🔎 DISCOVERY: candidate wallet found\n"
+        f"<code>{wallet}</code>\n"
+        f"Early buyer on {appearance_count} separate tokens that hit {config.DISCOVERY_SUCCESS_MULTIPLE}x+\n"
+        f"Recent examples: {mints_json}\n"
+        f"Not auto-added — review it, then add to WATCHED_WALLETS if it looks real."
+    )
