@@ -82,6 +82,9 @@ async def on_account_trade(trade: dict):
         return
     if position_manager.count_open("og_wallet") >= config.MAX_CONCURRENT_OG_POSITIONS:
         return
+    wallet_max_concurrent = config.WALLET_EXIT_OVERRIDES.get(wallet, {}).get("max_concurrent")
+    if wallet_max_concurrent is not None and position_manager.count_open_for_wallet(wallet) >= wallet_max_concurrent:
+        return
     mint = trade["mint"]
     dormant, reason = wallet_tracker.is_dormant_enough(mint)
     if not dormant:

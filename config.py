@@ -104,28 +104,32 @@ WALLET_EXIT_OVERRIDES = {
     # 2x actually captured (well below the token's theoretical move, since
     # slippage/timing eats most of a naive "buy at 300mc, sell at 2k mc"
     # fantasy return) — targets set to match REAL captured outcomes, not
-    # the token's theoretical ceiling.
+    # the token's theoretical ceiling. Rare/high-conviction -> bigger size,
+    # small reserved concurrency slot so a busy day for Meme Detective can
+    # never lock him out.
     "2YBHj8kf7AMgwhMKfMUxsyBk9UuX87FUq7UFFQDL9Atq": {
         "tp1_multiple": 1.4, "tp1_sell_fraction": 0.5, "tp2_multiple": 2.0,
         "sl_pct": 0.30, "max_hold_seconds": 900,
+        "buy_size_sol": 0.08, "max_concurrent": 2,
     },
     # Meme Detective — trades daily, farms a lot (many low-quality buys),
-    # occasionally shills a real mover on Twitter. Until we have a way to
-    # tell his farm buys from real ones (see WATCHED_WALLETS comment below),
-    # the plan is: copy everything, very fast in/out, smaller size, tighter
-    # stop — treat every trade as probably-a-farm until proven otherwise,
-    # so a single bad one can't do much damage.
-    # "<MEME_DETECTIVE_WALLET_ADDRESS_HERE>": {
-    #     "tp1_multiple": 1.3, "tp1_sell_fraction": 0.6, "tp2_multiple": 1.8,
-    #     "sl_pct": 0.20, "max_hold_seconds": 300,
-    # },
+    # occasionally shills a real mover on Twitter. Decided against building
+    # a farm-vs-real classifier for him (tried something similar before,
+    # didn't pan out) — accepting the farming as a cost of doing business
+    # and leaning on fast execution instead: smaller size per trade (since
+    # most individual trades are probably farms) and a tighter, faster exit
+    # so no single one does much damage either way.
+    "6qudAN2kV8mtCcYJxb5QQ6Vr15itdHHdeVbYm99NKMhy": {
+        "tp1_multiple": 1.3, "tp1_sell_fraction": 0.6, "tp2_multiple": 1.8,
+        "sl_pct": 0.20, "max_hold_seconds": 300,
+        "buy_size_sol": 0.03, "max_concurrent": 3,
+    },
 }
 
 # Wallets to watch for OG-token buys. Format: {"label": "address"}.
-# NOTE: Meme Detective's address isn't in here yet — add it once you have it
-# (and uncomment his WALLET_EXIT_OVERRIDES entry above).
 WATCHED_WALLETS = {
     "seven_pm_guy": "2YBHj8kf7AMgwhMKfMUxsyBk9UuX87FUq7UFFQDL9Atq",
+    "meme_detective": "6qudAN2kV8mtCcYJxb5QQ6Vr15itdHHdeVbYm99NKMhy",
 }
 
 # Wallet-hopping: if a watched wallet goes quiet for this long, check its

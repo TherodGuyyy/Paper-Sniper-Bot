@@ -38,6 +38,10 @@ def count_open(strategy: str) -> int:
     return len([p for p in _open_positions.values() if p["strategy"] == strategy])
 
 
+def count_open_for_wallet(wallet_addr: str) -> int:
+    return len([p for p in _open_positions.values() if p.get("triggered_by_wallet") == wallet_addr])
+
+
 def update_reserve_cache(mint: str, v_sol: float, v_tokens: float):
     if v_sol and v_tokens:
         _reserve_cache[mint] = (v_sol, v_tokens)
@@ -148,10 +152,11 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
     tp2_multiple = overrides.get("tp2_multiple", config.OG_TP2_MULTIPLE)
     sl_pct = overrides.get("sl_pct", config.OG_STOP_LOSS_PCT)
     max_hold_seconds = overrides.get("max_hold_seconds", config.OG_MAX_HOLD_SECONDS)
+    buy_size_sol = overrides.get("buy_size_sol", config.OG_BUY_SIZE_SOL)
 
     update_reserve_cache(mint, v_sol, v_tokens)
     try:
-        fill = curve_math.simulate_buy(v_sol, v_tokens, config.OG_BUY_SIZE_SOL, config.PUMPFUN_FEE_PCT)
+        fill = curve_math.simulate_buy(v_sol, v_tokens, buy_size_sol, config.PUMPFUN_FEE_PCT)
     except ValueError as e:
         db.log_missed("og_wallet", mint, f"buy sim error: {e}")
         return
@@ -159,7 +164,7 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
     priority_fee = random.uniform(config.PRIORITY_FEE_SOL_MIN, config.PRIORITY_FEE_SOL_MAX)
     trade_id = db.open_trade(
         strategy="og_wallet", mint=mint, entry_price=fill.effective_price,
-        entry_sol_in=config.OG_BUY_SIZE_SOL, entry_tokens=fill.tokens_or_sol_received,
+        entry_sol_in=buy_size_sol, entry_tokens=fill.tokens_or_sol_received,
         entry_price_impact_pct=fill.price_impact_pct, entry_fee_sol=fill.fee_paid_sol,
         priority_fee_sol=priority_fee,
         tp1_multiple=tp1_multiple, tp1_sell_fraction=tp1_sell_fraction,
@@ -169,15 +174,15 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
     )
     _open_positions[mint] = {
         "id": trade_id, "strategy": "og_wallet", "entry_time": time.time(),
-        "entry_price": fill.effective_price, "entry_sol_in": config.OG_BUY_SIZE_SOL,
+        "entry_price": fill.effective_price, "entry_sol_in": buy_size_sol,
         "remaining_tokens": fill.tokens_or_sol_received, "priority_fee_sol": priority_fee,
         "tp1_multiple": tp1_multiple, "tp1_sell_fraction": tp1_sell_fraction,
         "tp2_multiple": tp2_multiple, "sl_pct": sl_pct, "max_hold": max_hold_seconds,
         "tp1_done": False, "realized_pnl_sol": 0.0, "triggered_by_wallet": wallet_addr,
         "baseline_reserves": (v_sol, v_tokens),
     }
-    log.info(f"[OPEN og_wallet] {mint} triggered_by={watched_wallet_label} entry_price={fill.effective_price:.10f} (tp1={tp1_multiple}x tp2={tp2_multiple}x hold={max_hold_seconds}s)")
-    await telegram_sender.send_trade_open_alert("og_wallet", mint, fill.effective_price, config.OG_BUY_SIZE_SOL)
+    log.info(f"[OPEN og_wallet] {mint} triggered_by={watched_wallet_label} entry_price={fill.effective_price:.10f} size={buy_size_sol} (tp1={tp1_multiple}x tp2={tp2_multiple}x hold={max_hold_seconds}s)")
+    await telegram_sender.send_trade_open_alert("og_wallet", mint, fill.effective_price, buy_size_sol)
     return trade_id
 
 
