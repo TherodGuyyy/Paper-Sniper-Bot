@@ -85,6 +85,16 @@ OG_BUY_SIZE_SOL = 0.03
 DORMANT_MIN_TOKEN_AGE_HOURS = 24
 DORMANT_MIN_QUIET_HOURS = 6
 
+# FIX (Sep 2026): the dormancy check above requires the bot to have watched a
+# token get created AND then age 24h+, which almost nothing satisfies in
+# practice (either too new, or "unknown age" because it predates this run).
+# That silently blocked nearly all real copy-trades from firing at all,
+# defeating the actual goal — blind-copying everything a watched wallet does,
+# farms included, to measure overall profitability. Off by default now so
+# every watched-wallet buy is attempted. Flip back to True only if you
+# specifically want the narrower "old dormant token revival" behavior.
+OG_REQUIRE_DORMANT_TOKEN = False
+
 # Exit logic (Strategy B) — DEFAULTS used only when a watched wallet has no
 # entry in WALLET_EXIT_OVERRIDES below. With two very different real traders
 # now in play (a rare, big-move guy vs. a daily high-frequency one), one

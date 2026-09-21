@@ -86,10 +86,11 @@ async def on_account_trade(trade: dict):
     if wallet_max_concurrent is not None and position_manager.count_open_for_wallet(wallet) >= wallet_max_concurrent:
         return
     mint = trade["mint"]
-    dormant, reason = wallet_tracker.is_dormant_enough(mint)
-    if not dormant:
-        log.info(f"[og_wallet skip] {wallet[:8]} bought {mint}: {reason}")
-        return
+    if config.OG_REQUIRE_DORMANT_TOKEN:
+        dormant, reason = wallet_tracker.is_dormant_enough(mint)
+        if not dormant:
+            log.info(f"[og_wallet skip] {wallet[:8]} bought {mint}: {reason}")
+            return
     if not trade.get("v_sol") or not trade.get("v_tokens"):
         log.info(f"[og_wallet skip] {mint}: no reserve data on this trade event")
         return
