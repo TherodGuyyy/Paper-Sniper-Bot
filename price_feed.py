@@ -64,29 +64,37 @@ async def _fetch_coingecko(client: httpx.AsyncClient) -> float | None:
     return float(resp.json()["solana"]["usd"])
 
 
-JUPITER_PRICE_URL = "https://api.jup.ag/price/v2"
+JUPITER_PRICE_URL = "https://api.jup.ag/price/v3"
 
 
-async def get_jupiter_price_sol(mint: str) -> float | None:
-    """Current price of `mint` in SOL, via Jupiter's price API (USD) divided
-    by the cached SOL/USD rate. Used only for Raydium/Jupiter-sourced
-    positions that have no pump.fun bonding curve to price against.
+async def get_jupiter_prices_sol(mints: list[str]) -> dict[str, float]:
+    """Current price of each mint in `mints`, in SOL, via Jupiter's Price
+    API V3 (USD) divided by the cached SOL/USD rate. Batched into a single
+    request (V3 supports up to 50 ids per call) rather than one call per
+    mint — keeps us well under Jupiter's keyless rate limit even with
+    several Raydium-sourced positions open at once. Any mint V3 has no
+    reliable price for (untraded recently, or flagged) is simply absent
+    from the response — not an error — so it's just missing from the
+    returned dict; the caller should treat that mint as "no price this
+    cycle" rather than a fetch failure.
     NOTE: verify this endpoint still responds this way once deployed —
-    Jupiter has changed this API's path before (v4 -> v2), and if it moves
-    again this is the one function to update. On any failure this returns
-    None and the caller should skip that check cycle rather than guess."""
-    if _cached_price is None:
-        return None
+    Jupiter has changed this API's path/shape before (v2 -> v3), and if it
+    moves again this is the one function to update."""
+    if not mints or _cached_price is None:
+        return {}
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(JUPITER_PRICE_URL, params={"ids": mint})
+            resp = await client.get(JUPITER_PRICE_URL, params={"ids": ",".join(mints)})
             resp.raise_for_status()
             data = resp.json()
-            usd_price = float(data["data"][mint]["price"])
-            return usd_price / _cached_price
+            return {
+                mint: float(entry["usdPrice"]) / _cached_price
+                for mint, entry in data.items()
+                if entry and entry.get("usdPrice") is not None
+            }
     except Exception as e:
-        log.warning(f"Jupiter price fetch failed for {mint}: {e}")
-        return None
+        log.warning(f"Jupiter price fetch failed for {len(mints)} mint(s): {e}")
+        return {}
 
 
 async def refresh_loop():

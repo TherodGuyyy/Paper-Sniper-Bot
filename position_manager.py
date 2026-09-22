@@ -288,21 +288,29 @@ async def raydium_price_poll_loop():
     while True:
         await asyncio.sleep(config.RAYDIUM_PRICE_POLL_SECONDS)
         now = time.time()
-        for mint in list(_open_positions.keys()):
+        raydium_mints = [
+            mint for mint, pos in _open_positions.items()
+            if pos.get("price_source") == "raydium"
+        ]
+        if not raydium_mints:
+            continue
+        prices = await price_feed.get_jupiter_prices_sol(raydium_mints)
+
+        for mint in raydium_mints:
             pos = _open_positions.get(mint)
-            if not pos or pos.get("price_source") != "raydium":
-                continue
+            if not pos:
+                continue  # closed by another path mid-loop
 
             elapsed = now - pos["entry_time"]
+            current_price = prices.get(mint)
+
             if elapsed >= pos["max_hold"]:
-                current_price = await price_feed.get_jupiter_price_sol(mint)
                 if current_price:
                     await _raydium_close(mint, pos, current_price, "time_exit")
                 continue
 
-            current_price = await price_feed.get_jupiter_price_sol(mint)
             if not current_price:
-                continue  # couldn't get a price this cycle — try again next poll
+                continue  # not in this cycle's batch response — try again next poll
 
             multiple = current_price / pos["entry_price"]
             change_pct = multiple - 1.0
