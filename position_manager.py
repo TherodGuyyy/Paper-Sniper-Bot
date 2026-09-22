@@ -19,6 +19,7 @@ import time
 import config
 import curve_math
 import db
+import price_feed
 import telegram_sender
 
 log = logging.getLogger("position_manager")
@@ -59,6 +60,10 @@ async def reconcile_open_positions(ppclient):
     rows = db.get_open_trades()
     for r in rows:
         mint = r["mint"]
+        # meta_json is a loose str(dict) (not real JSON, matches how it's
+        # written elsewhere in this file) — a raydium-sourced position tags
+        # itself this way at open time so a restart can tell the two apart.
+        is_raydium = "'source': 'raydium'" in (r["meta_json"] or "")
         _open_positions[mint] = {
             "id": r["id"],
             "strategy": r["strategy"],
@@ -76,8 +81,10 @@ async def reconcile_open_positions(ppclient):
             "realized_pnl_sol": r["realized_pnl_sol"] or 0,
             "triggered_by_wallet": r["triggered_by_wallet"],
             "baseline_reserves": None,  # not persisted — dead-token early exit just won't apply to reconciled positions, max_hold still will
+            "price_source": "raydium" if is_raydium else "curve",
         }
-        await ppclient.subscribe_mint_trades(mint)
+        if not is_raydium:
+            await ppclient.subscribe_mint_trades(mint)
     if rows:
         log.info(f"reconciled {len(rows)} open position(s) from previous run")
 
@@ -184,6 +191,127 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
     log.info(f"[OPEN og_wallet] {mint} triggered_by={watched_wallet_label} entry_price={fill.effective_price:.10f} size={buy_size_sol} (tp1={tp1_multiple}x tp2={tp2_multiple}x hold={max_hold_seconds}s)")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, fill.effective_price, buy_size_sol)
     return trade_id
+
+
+async def attempt_og_snipe_raydium(mint: str, entry_price_sol: float, wallet_addr: str, watched_wallet_label: str, source: str = "raydium"):
+    """Same idea as attempt_og_snipe, but for a buy detected via the Helius
+    webhook (Raydium/Jupiter/etc) instead of PumpPortal. No bonding curve
+    exists for these, so entry/exit pricing is done directly off the
+    watched wallet's own executed price and later Jupiter price polls
+    (see raydium_price_poll_loop), not curve_math."""
+    if mint in _open_positions:
+        return
+
+    overrides = config.WALLET_EXIT_OVERRIDES.get(wallet_addr, {})
+    tp1_multiple = overrides.get("tp1_multiple", config.OG_TP1_MULTIPLE)
+    tp1_sell_fraction = overrides.get("tp1_sell_fraction", config.OG_TP1_SELL_FRACTION)
+    tp2_multiple = overrides.get("tp2_multiple", config.OG_TP2_MULTIPLE)
+    sl_pct = overrides.get("sl_pct", config.OG_STOP_LOSS_PCT)
+    max_hold_seconds = overrides.get("max_hold_seconds", config.OG_MAX_HOLD_SECONDS)
+    buy_size_sol = overrides.get("buy_size_sol", config.OG_BUY_SIZE_SOL)
+
+    if not entry_price_sol or entry_price_sol <= 0:
+        db.log_missed("og_wallet", mint, "raydium: invalid entry price computed from webhook")
+        return
+
+    fee_sol = buy_size_sol * config.RAYDIUM_FEE_PCT
+    net_sol_for_tokens = buy_size_sol - fee_sol
+    tokens_received = net_sol_for_tokens / entry_price_sol
+    priority_fee = random.uniform(config.PRIORITY_FEE_SOL_MIN, config.PRIORITY_FEE_SOL_MAX)
+
+    trade_id = db.open_trade(
+        strategy="og_wallet", mint=mint, entry_price=entry_price_sol,
+        entry_sol_in=buy_size_sol, entry_tokens=tokens_received,
+        entry_price_impact_pct=0.0, entry_fee_sol=fee_sol,
+        priority_fee_sol=priority_fee,
+        tp1_multiple=tp1_multiple, tp1_sell_fraction=tp1_sell_fraction,
+        tp2_multiple=tp2_multiple, sl_pct=sl_pct, max_hold_seconds=max_hold_seconds,
+        triggered_by_wallet=wallet_addr,
+        meta_json=str({"triggered_by": watched_wallet_label, "source": source}),
+    )
+    _open_positions[mint] = {
+        "id": trade_id, "strategy": "og_wallet", "entry_time": time.time(),
+        "entry_price": entry_price_sol, "entry_sol_in": buy_size_sol,
+        "remaining_tokens": tokens_received, "priority_fee_sol": priority_fee,
+        "tp1_multiple": tp1_multiple, "tp1_sell_fraction": tp1_sell_fraction,
+        "tp2_multiple": tp2_multiple, "sl_pct": sl_pct, "max_hold": max_hold_seconds,
+        "tp1_done": False, "realized_pnl_sol": 0.0, "triggered_by_wallet": wallet_addr,
+        "baseline_reserves": None, "price_source": "raydium",
+    }
+    log.info(f"[OPEN og_wallet_raydium] {mint} triggered_by={watched_wallet_label} entry_price={entry_price_sol:.10f} size={buy_size_sol} source={source}")
+    await telegram_sender.send_trade_open_alert("og_wallet", mint, entry_price_sol, buy_size_sol)
+    return trade_id
+
+
+def _raydium_fill(sol_amount: float, price: float):
+    """Mirrors curve_math's Fill shape closely enough for the two exit
+    helpers below, without needing bonding-curve reserves."""
+    fee = sol_amount * config.RAYDIUM_FEE_PCT if sol_amount > 0 else 0
+    return sol_amount - fee, fee
+
+
+async def _raydium_partial_exit(mint: str, pos: dict, current_price: float):
+    sell_tokens = pos["remaining_tokens"] * pos["tp1_sell_fraction"]
+    gross_sol_out = sell_tokens * current_price
+    realized, fee = _raydium_fill(gross_sol_out, current_price)
+    pos["remaining_tokens"] -= sell_tokens
+    pos["realized_pnl_sol"] += realized
+    pos["tp1_done"] = True
+    db.record_partial_exit(pos["id"], pos["remaining_tokens"], realized)
+    log.info(f"[PARTIAL TP1 og_wallet_raydium] {mint} sold {pos['tp1_sell_fraction']:.0%} realized={realized:+.4f} SOL")
+    await telegram_sender.send_partial_exit_alert(pos["strategy"], mint, pos["tp1_sell_fraction"], realized)
+
+
+async def _raydium_close(mint: str, pos: dict, current_price: float, reason: str):
+    gross_sol_out = pos["remaining_tokens"] * current_price
+    final_leg_pnl, fee = _raydium_fill(gross_sol_out, current_price)
+    total_pnl_sol = pos["realized_pnl_sol"] + final_leg_pnl - pos["entry_sol_in"] - pos["priority_fee_sol"]
+    pnl_pct = total_pnl_sol / pos["entry_sol_in"]
+
+    db.close_trade(pos["id"], current_price, gross_sol_out, reason, fee, total_pnl_sol, pnl_pct)
+    log.info(f"[CLOSE og_wallet_raydium] {mint} reason={reason} pnl={total_pnl_sol:+.4f} SOL ({pnl_pct:+.1%})")
+    await telegram_sender.send_trade_close_alert(pos["strategy"], mint, reason, total_pnl_sol, pnl_pct)
+
+    if pos.get("triggered_by_wallet"):
+        db.record_wallet_trade_result(pos["triggered_by_wallet"], "", total_pnl_sol)
+
+    del _open_positions[mint]
+    return total_pnl_sol, pnl_pct, reason
+
+
+async def raydium_price_poll_loop():
+    """Standalone exit-checker for Raydium/Jupiter-sourced positions —
+    these have no trade-event stream the way pump.fun mints do (that's what
+    on_trade_event/sweep_time_exits rely on), so this polls Jupiter instead.
+    Runs independently of sweep_time_exits so the existing, already-tested
+    pump.fun exit path is untouched."""
+    while True:
+        await asyncio.sleep(config.RAYDIUM_PRICE_POLL_SECONDS)
+        now = time.time()
+        for mint in list(_open_positions.keys()):
+            pos = _open_positions.get(mint)
+            if not pos or pos.get("price_source") != "raydium":
+                continue
+
+            elapsed = now - pos["entry_time"]
+            if elapsed >= pos["max_hold"]:
+                current_price = await price_feed.get_jupiter_price_sol(mint)
+                if current_price:
+                    await _raydium_close(mint, pos, current_price, "time_exit")
+                continue
+
+            current_price = await price_feed.get_jupiter_price_sol(mint)
+            if not current_price:
+                continue  # couldn't get a price this cycle — try again next poll
+
+            multiple = current_price / pos["entry_price"]
+            change_pct = multiple - 1.0
+            if multiple >= pos["tp2_multiple"]:
+                await _raydium_close(mint, pos, current_price, "take_profit_2")
+            elif not pos["tp1_done"] and multiple >= pos["tp1_multiple"]:
+                await _raydium_partial_exit(mint, pos, current_price)
+            elif change_pct <= -pos["sl_pct"]:
+                await _raydium_close(mint, pos, current_price, "stop_loss")
 
 
 async def _partial_exit(mint: str, pos: dict, v_sol: float, v_tokens: float, ppclient=None):

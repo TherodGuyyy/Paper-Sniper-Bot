@@ -142,6 +142,37 @@ WATCHED_WALLETS = {
     "meme_detective": "6qudAN2kV8mtCcYJxb5QQ6Vr15itdHHdeVbYm99NKMhy",
 }
 
+# ---------------------------------------------------------------------------
+# STRATEGY B, RAYDIUM/JUPITER COVERAGE (Sep 2026) — PumpPortal's account-trade
+# feed only sees trades that touch the pump.fun/PumpSwap program. Once a
+# watched wallet's token has migrated to Raydium (or they buy anything
+# through Jupiter routing), PumpPortal never fires for it — confirmed via a
+# real missed trade (Meme Detective buying PFBABY on Raydium, invisible to
+# the bot). This closes that gap with a Helius webhook subscribed to the
+# watched wallets directly, which sees ALL their on-chain swaps regardless
+# of venue. Set up required on Helius's side (helius.dev dashboard ->
+# Webhooks): create an "Enhanced" webhook, type SWAP, account addresses =
+# the two WATCHED_WALLETS values above, webhook URL =
+# https://<your-render-url>/helius-webhook, and set the Authorization header
+# below to a random string you generate yourself (also paste that same
+# string into HELIUS_WEBHOOK_SECRET as a Render env var).
+# ---------------------------------------------------------------------------
+HELIUS_WEBHOOK_SECRET = os.environ.get("HELIUS_WEBHOOK_SECRET", "")
+
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+# Modeled fee+slippage for a Raydium/Jupiter fill — we don't get a real
+# quote for these paper trades, just the watched wallet's own executed
+# price, so this pads entry cost a bit to stay conservative. VERIFY against
+# a few real Raydium receipts if you want to tighten this.
+RAYDIUM_FEE_PCT = 0.006
+
+# How often to poll Jupiter for current price on open Raydium-sourced
+# positions, to check TP1/TP2/stop-loss/max-hold. No trade-event stream
+# exists for these like there is for pump.fun mints, so this has to poll.
+RAYDIUM_PRICE_POLL_SECONDS = 8
+
 # Wallet-hopping: if a watched wallet goes quiet for this long, check its
 # recent outgoing SOL transfers for a likely successor wallet and auto-add it
 WALLET_QUIET_DAYS_BEFORE_SUCCESSOR_CHECK = 4

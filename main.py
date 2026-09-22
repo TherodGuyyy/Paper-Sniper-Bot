@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -9,12 +10,15 @@ import config
 import db
 import discovery
 import filters
+import helius_webhook
 import position_manager
 import price_feed
 import telegram_commands
 import telegram_sender
 import wallet_tracker
 from pumpportal_client import PumpPortalClient
+
+MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("main")
@@ -37,6 +41,41 @@ class _HealthHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
+
+    def do_POST(self):
+        """Receives Helius Enhanced Webhook payloads — see config.py's
+        HELIUS_WEBHOOK_SECRET comment for the one-time Helius dashboard
+        setup this depends on. Runs in this handler's own thread (stdlib
+        http.server, not asyncio), so actual processing is handed off to
+        the main asyncio loop via run_coroutine_threadsafe rather than
+        awaited here directly."""
+        if self.path != "/helius-webhook":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        auth = self.headers.get("Authorization", "")
+        if not config.HELIUS_WEBHOOK_SECRET or auth != config.HELIUS_WEBHOOK_SECRET:
+            log.warning("rejected /helius-webhook call: missing/incorrect Authorization header")
+            self.send_response(401)
+            self.end_headers()
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
+        self.send_response(200)  # ack immediately — Helius retries on non-2xx
+        self.end_headers()
+
+        try:
+            events = json.loads(raw)
+            if isinstance(events, dict):
+                events = [events]
+        except Exception as e:
+            log.warning(f"couldn't parse /helius-webhook body: {e}")
+            return
+
+        if MAIN_LOOP:
+            asyncio.run_coroutine_threadsafe(handle_helius_events(events), MAIN_LOOP)
 
     def log_message(self, format, *args):
         pass  # don't spam Render logs with every health-check hit
@@ -97,6 +136,33 @@ async def on_account_trade(trade: dict):
     await position_manager.attempt_og_snipe(mint, trade["v_sol"], trade["v_tokens"], wallet, label)
 
 
+async def handle_helius_events(events: list):
+    """Raydium/Jupiter/etc counterpart to on_account_trade — same gating
+    (enabled flag, global + per-wallet concurrency caps), different data
+    source and pricing path (see position_manager.attempt_og_snipe_raydium).
+    Deliberately does NOT apply OG_REQUIRE_DORMANT_TOKEN — that check is
+    pump.fun-launch-age-specific and doesn't translate to a token that's
+    already migrated venues."""
+    if not config.OG_WALLET_SNIPE_ENABLED:
+        return
+    for ev in helius_webhook.parse_payload(events):
+        wallet = ev["wallet"]
+        mint = ev["mint"]
+        db.touch_watchlist_wallet(wallet)
+
+        if position_manager.count_open("og_wallet") >= config.MAX_CONCURRENT_OG_POSITIONS:
+            db.log_missed("og_wallet", mint, "at MAX_CONCURRENT_OG_POSITIONS cap (raydium)")
+            continue
+        wallet_max_concurrent = config.WALLET_EXIT_OVERRIDES.get(wallet, {}).get("max_concurrent")
+        if wallet_max_concurrent is not None and position_manager.count_open_for_wallet(wallet) >= wallet_max_concurrent:
+            continue
+
+        log.info(f"[helius] {ev['label']} bought {mint} on {ev['source']} @ {ev['entry_price_sol']:.10f} SOL")
+        await position_manager.attempt_og_snipe_raydium(
+            mint, ev["entry_price_sol"], wallet, ev["label"], source="raydium"
+        )
+
+
 async def on_connection_status(reconnect=False, failing=False, error=None):
     if failing:
         await telegram_sender.send(
@@ -131,6 +197,13 @@ async def successor_check_loop():
 
 
 async def main():
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
+    if not config.HELIUS_WEBHOOK_SECRET:
+        log.warning(
+            "HELIUS_WEBHOOK_SECRET is not set — /helius-webhook will reject all "
+            "calls. Raydium/Jupiter coverage is OFF until this is set (see config.py)."
+        )
     start_health_server()
     db.init_db()
     wallet_tracker.load_watchlist_into_config()
@@ -147,6 +220,7 @@ async def main():
     await asyncio.gather(
         ppclient.run_forever(),
         position_manager.sweep_time_exits(ppclient),
+        position_manager.raydium_price_poll_loop(),
         daily_summary_loop(),
         successor_check_loop(),
         price_feed.refresh_loop(),

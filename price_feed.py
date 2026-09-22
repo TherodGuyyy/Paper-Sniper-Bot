@@ -64,6 +64,31 @@ async def _fetch_coingecko(client: httpx.AsyncClient) -> float | None:
     return float(resp.json()["solana"]["usd"])
 
 
+JUPITER_PRICE_URL = "https://api.jup.ag/price/v2"
+
+
+async def get_jupiter_price_sol(mint: str) -> float | None:
+    """Current price of `mint` in SOL, via Jupiter's price API (USD) divided
+    by the cached SOL/USD rate. Used only for Raydium/Jupiter-sourced
+    positions that have no pump.fun bonding curve to price against.
+    NOTE: verify this endpoint still responds this way once deployed —
+    Jupiter has changed this API's path before (v4 -> v2), and if it moves
+    again this is the one function to update. On any failure this returns
+    None and the caller should skip that check cycle rather than guess."""
+    if _cached_price is None:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(JUPITER_PRICE_URL, params={"ids": mint})
+            resp.raise_for_status()
+            data = resp.json()
+            usd_price = float(data["data"][mint]["price"])
+            return usd_price / _cached_price
+    except Exception as e:
+        log.warning(f"Jupiter price fetch failed for {mint}: {e}")
+        return None
+
+
 async def refresh_loop():
     global _cached_price
     while True:
