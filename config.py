@@ -75,7 +75,19 @@ DEAD_TOKEN_EXIT_SECONDS = 90  # NEW — if a position has seen ZERO trade activi
 # ---------------------------------------------------------------------------
 OG_WALLET_SNIPE_ENABLED = True
 
-OG_BUY_SIZE_SOL = 0.03
+# ---------------------------------------------------------------------------
+# POSITION SIZING (Sep 2026) — was a flat SOL amount per wallet regardless of
+# balance. Switched to a % of current balance so size scales with account
+# growth/drawdown automatically instead of needing manual updates.
+# "fixed" keeps the old behavior (OG_BUY_SIZE_SOL / per-wallet buy_size_sol)
+# if you ever want to go back to it.
+# ---------------------------------------------------------------------------
+OG_BUY_SIZE_MODE = "pct_of_balance"  # "pct_of_balance" or "fixed"
+OG_BUY_SIZE_PCT = 0.05  # default 5% of current balance, used if a wallet has no buy_size_pct override below
+OG_BUY_SIZE_MIN_SOL = 0.01  # floor — never size a trade below this even if balance is badly drawn down
+OG_BUY_SIZE_MAX_SOL = 1.0   # ceiling — caps a single trade's size even if balance grows a lot; tune as balance grows
+
+OG_BUY_SIZE_SOL = 0.03  # only used if OG_BUY_SIZE_MODE = "fixed"
 
 # A token counts as "dormant" if it's older than this AND we've observed no
 # trades on it (in our own running session) for at least this many hours
@@ -105,6 +117,21 @@ OG_TP2_MULTIPLE = 2.0
 OG_STOP_LOSS_PCT = 0.30
 OG_MAX_HOLD_SECONDS = 900
 
+# ---------------------------------------------------------------------------
+# EXIT SANITY GUARD (Sep 2026) — a real incident: a trade closed for +5854%
+# pnl on a $3.54 position, seconds after opening. Root cause: the exit path
+# trusts whatever v_sol/v_tokens the latest incoming trade event reports,
+# with no check at all (the BUY path already has MAX_SLIPPAGE_PCT for this
+# exact reason — the SELL/exit path never got the same guard). Pump.fun
+# tokens right at their bonding-curve migration boundary can emit one
+# erratic final reserve reading, and the bot was taking that completely at
+# face value. A single trade tick implying a multiple beyond
+# tp2_multiple * this factor is treated as probably-bad data — skipped
+# (not executed, not counted toward peak tracking), logged, and
+# re-evaluated on the next tick instead.
+# ---------------------------------------------------------------------------
+MAX_EXIT_MULTIPLE_SANITY_FACTOR = 3.0
+
 # Per-wallet exit overrides, keyed by wallet address. Any key you don't set
 # for a wallet falls back to the OG_* defaults above.
 WALLET_EXIT_OVERRIDES = {
@@ -120,7 +147,7 @@ WALLET_EXIT_OVERRIDES = {
     "2YBHj8kf7AMgwhMKfMUxsyBk9UuX87FUq7UFFQDL9Atq": {
         "tp1_multiple": 1.4, "tp1_sell_fraction": 0.5, "tp2_multiple": 2.0,
         "sl_pct": 0.30, "max_hold_seconds": 900,
-        "buy_size_sol": 0.08, "max_concurrent": 2,
+        "buy_size_pct": 0.065, "max_concurrent": 2,  # was a flat 0.08 SOL — 6.5% keeps roughly the same ratio vs meme_detective below, now scales with balance
     },
     # Meme Detective — trades daily, farms a lot (many low-quality buys),
     # occasionally shills a real mover on Twitter. Decided against building
@@ -132,7 +159,7 @@ WALLET_EXIT_OVERRIDES = {
     "6qudAN2kV8mtCcYJxb5QQ6Vr15itdHHdeVbYm99NKMhy": {
         "tp1_multiple": 1.3, "tp1_sell_fraction": 0.6, "tp2_multiple": 1.8,
         "sl_pct": 0.20, "max_hold_seconds": 300,
-        "buy_size_sol": 0.03, "max_concurrent": 3,
+        "buy_size_pct": 0.025, "max_concurrent": 3,  # was a flat 0.03 SOL — smaller %, same reasoning as before (most individual trades are probably farms)
     },
 }
 

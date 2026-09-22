@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_fee_sol REAL,
     pnl_sol REAL,
     pnl_pct REAL,
+    peak_price REAL,      -- highest PLAUSIBLE price observed while open (see MAX_EXIT_MULTIPLE_SANITY_FACTOR)
+    peak_multiple REAL,   -- that peak, expressed as a multiple of entry_price
     miss_reason TEXT,                   -- filled if status='missed'
     meta_json TEXT
 );
@@ -84,6 +86,13 @@ CREATE TABLE IF NOT EXISTS wallet_discovery (
 def init_db():
     conn = sqlite3.connect(config.DB_PATH)
     conn.executescript(SCHEMA)
+    # Migration for DBs created before peak tracking existed — CREATE TABLE
+    # IF NOT EXISTS above doesn't add columns to an already-existing table.
+    for col in ("peak_price REAL", "peak_multiple REAL"):
+        try:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
     conn.close()
 
@@ -137,13 +146,15 @@ def record_partial_exit(trade_id, remaining_tokens, realized_pnl_delta_sol):
         )
 
 
-def close_trade(trade_id, exit_price, exit_sol_out, exit_reason, exit_fee_sol, pnl_sol, pnl_pct):
+def close_trade(trade_id, exit_price, exit_sol_out, exit_reason, exit_fee_sol, pnl_sol, pnl_pct,
+                 peak_price=None, peak_multiple=None):
     """pnl_sol here should be the TOTAL trade P&L (realized partial + final leg)."""
     with get_conn() as conn:
         conn.execute(
             """UPDATE trades SET status='closed', exit_time=?, exit_price=?, exit_sol_out=?,
-               exit_reason=?, exit_fee_sol=?, pnl_sol=?, pnl_pct=? WHERE id=?""",
-            (time.time(), exit_price, exit_sol_out, exit_reason, exit_fee_sol, pnl_sol, pnl_pct, trade_id),
+               exit_reason=?, exit_fee_sol=?, pnl_sol=?, pnl_pct=?, peak_price=?, peak_multiple=? WHERE id=?""",
+            (time.time(), exit_price, exit_sol_out, exit_reason, exit_fee_sol, pnl_sol, pnl_pct,
+             peak_price, peak_multiple, trade_id),
         )
 
 

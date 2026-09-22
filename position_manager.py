@@ -82,6 +82,7 @@ async def reconcile_open_positions(ppclient):
             "triggered_by_wallet": r["triggered_by_wallet"],
             "baseline_reserves": None,  # not persisted — dead-token early exit just won't apply to reconciled positions, max_hold still will
             "price_source": "raydium" if is_raydium else "curve",
+            "peak_multiple": 1.0, "peak_price": r["entry_price"],  # peak tracking restarts fresh after a restart — not persisted mid-trade
         }
         if not is_raydium:
             await ppclient.subscribe_mint_trades(mint)
@@ -143,10 +144,38 @@ async def attempt_launch_snipe(new_token: dict, ppclient):
         "tp2_multiple": config.TP2_MULTIPLE, "sl_pct": config.STOP_LOSS_PCT, "max_hold": config.MAX_HOLD_SECONDS,
         "tp1_done": False, "realized_pnl_sol": 0.0, "triggered_by_wallet": None,
         "baseline_reserves": (v_sol, v_tokens),
+        "peak_multiple": 1.0, "peak_price": fill.effective_price,
     }
     log.info(f"[OPEN launch] {mint} entry_price={fill.effective_price:.10f} impact={fill.price_impact_pct:.1%}")
     await telegram_sender.send_trade_open_alert("launch", mint, fill.effective_price, config.LAUNCH_BUY_SIZE_SOL)
     return trade_id
+
+
+def _update_peak(pos: dict, current_price: float):
+    multiple = current_price / pos["entry_price"]
+    if multiple > pos.get("peak_multiple", 1.0):
+        pos["peak_multiple"] = multiple
+        pos["peak_price"] = current_price
+
+
+def _is_plausible(pos: dict, multiple: float) -> bool:
+    """See MAX_EXIT_MULTIPLE_SANITY_FACTOR in config.py for why this
+    exists — a single trade tick implying a move far beyond what this
+    position's own TP2 target expects is treated as probably-bad reserve
+    data (most commonly right at a pump.fun migration boundary), not a
+    real price move, and is skipped rather than acted on or counted."""
+    limit = pos["tp2_multiple"] * config.MAX_EXIT_MULTIPLE_SANITY_FACTOR
+    return multiple <= limit
+    """Fixed-SOL sizing was blind to account growth/drawdown. This reads
+    from overrides, or falls back to the global config default, whichever
+    sizing mode is active — same helper used by both the pump.fun and
+    Raydium buy paths so sizing behaves identically regardless of venue."""
+    if config.OG_BUY_SIZE_MODE == "pct_of_balance":
+        pct = overrides.get("buy_size_pct", config.OG_BUY_SIZE_PCT)
+        balance = db.get_current_balance_sol()
+        size = balance * pct
+        return max(config.OG_BUY_SIZE_MIN_SOL, min(size, config.OG_BUY_SIZE_MAX_SOL))
+    return overrides.get("buy_size_sol", config.OG_BUY_SIZE_SOL)
 
 
 async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr: str, watched_wallet_label: str):
@@ -159,7 +188,7 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
     tp2_multiple = overrides.get("tp2_multiple", config.OG_TP2_MULTIPLE)
     sl_pct = overrides.get("sl_pct", config.OG_STOP_LOSS_PCT)
     max_hold_seconds = overrides.get("max_hold_seconds", config.OG_MAX_HOLD_SECONDS)
-    buy_size_sol = overrides.get("buy_size_sol", config.OG_BUY_SIZE_SOL)
+    buy_size_sol = _compute_buy_size_sol(overrides)
 
     update_reserve_cache(mint, v_sol, v_tokens)
     try:
@@ -187,6 +216,7 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
         "tp2_multiple": tp2_multiple, "sl_pct": sl_pct, "max_hold": max_hold_seconds,
         "tp1_done": False, "realized_pnl_sol": 0.0, "triggered_by_wallet": wallet_addr,
         "baseline_reserves": (v_sol, v_tokens),
+        "peak_multiple": 1.0, "peak_price": fill.effective_price,
     }
     log.info(f"[OPEN og_wallet] {mint} triggered_by={watched_wallet_label} entry_price={fill.effective_price:.10f} size={buy_size_sol} (tp1={tp1_multiple}x tp2={tp2_multiple}x hold={max_hold_seconds}s)")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, fill.effective_price, buy_size_sol)
@@ -208,7 +238,7 @@ async def attempt_og_snipe_raydium(mint: str, entry_price_sol: float, wallet_add
     tp2_multiple = overrides.get("tp2_multiple", config.OG_TP2_MULTIPLE)
     sl_pct = overrides.get("sl_pct", config.OG_STOP_LOSS_PCT)
     max_hold_seconds = overrides.get("max_hold_seconds", config.OG_MAX_HOLD_SECONDS)
-    buy_size_sol = overrides.get("buy_size_sol", config.OG_BUY_SIZE_SOL)
+    buy_size_sol = _compute_buy_size_sol(overrides)
 
     if not entry_price_sol or entry_price_sol <= 0:
         db.log_missed("og_wallet", mint, "raydium: invalid entry price computed from webhook")
@@ -237,6 +267,7 @@ async def attempt_og_snipe_raydium(mint: str, entry_price_sol: float, wallet_add
         "tp2_multiple": tp2_multiple, "sl_pct": sl_pct, "max_hold": max_hold_seconds,
         "tp1_done": False, "realized_pnl_sol": 0.0, "triggered_by_wallet": wallet_addr,
         "baseline_reserves": None, "price_source": "raydium",
+        "peak_multiple": 1.0, "peak_price": entry_price_sol,
     }
     log.info(f"[OPEN og_wallet_raydium] {mint} triggered_by={watched_wallet_label} entry_price={entry_price_sol:.10f} size={buy_size_sol} source={source}")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, entry_price_sol, buy_size_sol)
@@ -268,9 +299,10 @@ async def _raydium_close(mint: str, pos: dict, current_price: float, reason: str
     total_pnl_sol = pos["realized_pnl_sol"] + final_leg_pnl - pos["entry_sol_in"] - pos["priority_fee_sol"]
     pnl_pct = total_pnl_sol / pos["entry_sol_in"]
 
-    db.close_trade(pos["id"], current_price, gross_sol_out, reason, fee, total_pnl_sol, pnl_pct)
-    log.info(f"[CLOSE og_wallet_raydium] {mint} reason={reason} pnl={total_pnl_sol:+.4f} SOL ({pnl_pct:+.1%})")
-    await telegram_sender.send_trade_close_alert(pos["strategy"], mint, reason, total_pnl_sol, pnl_pct)
+    db.close_trade(pos["id"], current_price, gross_sol_out, reason, fee, total_pnl_sol, pnl_pct,
+                    peak_price=pos.get("peak_price"), peak_multiple=pos.get("peak_multiple"))
+    log.info(f"[CLOSE og_wallet_raydium] {mint} reason={reason} pnl={total_pnl_sol:+.4f} SOL ({pnl_pct:+.1%}) peak={pos.get('peak_multiple', 1.0):.2f}x")
+    await telegram_sender.send_trade_close_alert(pos["strategy"], mint, reason, total_pnl_sol, pnl_pct, peak_multiple=pos.get("peak_multiple"))
 
     if pos.get("triggered_by_wallet"):
         db.record_wallet_trade_result(pos["triggered_by_wallet"], "", total_pnl_sol)
@@ -306,6 +338,10 @@ async def raydium_price_poll_loop():
 
             if elapsed >= pos["max_hold"]:
                 if current_price:
+                    time_exit_multiple = current_price / pos["entry_price"]
+                    if not _is_plausible(pos, time_exit_multiple):
+                        log.warning(f"[SUSPECT DATA] {mint} time_exit price implies {time_exit_multiple:.1f}x — skipping this cycle, will retry")
+                        continue
                     await _raydium_close(mint, pos, current_price, "time_exit")
                 continue
 
@@ -314,6 +350,12 @@ async def raydium_price_poll_loop():
 
             multiple = current_price / pos["entry_price"]
             change_pct = multiple - 1.0
+
+            if not _is_plausible(pos, multiple):
+                log.warning(f"[SUSPECT DATA] {mint} Jupiter price implies {multiple:.1f}x in one poll tick — likely a bad/thin-liquidity reading, ignoring this cycle")
+                continue
+            _update_peak(pos, current_price)
+
             if multiple >= pos["tp2_multiple"]:
                 await _raydium_close(mint, pos, current_price, "take_profit_2")
             elif not pos["tp1_done"] and multiple >= pos["tp1_multiple"]:
@@ -353,10 +395,11 @@ async def _close(mint: str, pos: dict, v_sol: float, v_tokens: float, reason: st
     pnl_pct = total_pnl_sol / pos["entry_sol_in"]
 
     db.close_trade(
-        pos["id"], fill.effective_price, fill.tokens_or_sol_received, reason, fill.fee_paid_sol, total_pnl_sol, pnl_pct
+        pos["id"], fill.effective_price, fill.tokens_or_sol_received, reason, fill.fee_paid_sol, total_pnl_sol, pnl_pct,
+        peak_price=pos.get("peak_price"), peak_multiple=pos.get("peak_multiple"),
     )
-    log.info(f"[CLOSE {pos['strategy']}] {mint} reason={reason} pnl={total_pnl_sol:+.4f} SOL ({pnl_pct:+.1%})")
-    await telegram_sender.send_trade_close_alert(pos["strategy"], mint, reason, total_pnl_sol, pnl_pct)
+    log.info(f"[CLOSE {pos['strategy']}] {mint} reason={reason} pnl={total_pnl_sol:+.4f} SOL ({pnl_pct:+.1%}) peak={pos.get('peak_multiple', 1.0):.2f}x")
+    await telegram_sender.send_trade_close_alert(pos["strategy"], mint, reason, total_pnl_sol, pnl_pct, peak_multiple=pos.get("peak_multiple"))
 
     if pos["strategy"] == "og_wallet" and pos.get("triggered_by_wallet"):
         db.record_wallet_trade_result(pos["triggered_by_wallet"], "", total_pnl_sol)
@@ -387,6 +430,11 @@ async def on_trade_event(trade: dict, ppclient):
     multiple = current_price / pos["entry_price"]
     change_pct = multiple - 1.0
 
+    if not _is_plausible(pos, multiple):
+        log.warning(f"[SUSPECT DATA] {mint} trade event implies {multiple:.1f}x in one tick (v_sol={v_sol} v_tokens={v_tokens}) — likely a bad reading near migration, ignoring this tick")
+        return
+    _update_peak(pos, current_price)
+
     if multiple >= pos["tp2_multiple"]:
         await _close(mint, pos, v_sol, v_tokens, "take_profit_2", ppclient)
     elif not pos["tp1_done"] and multiple >= pos["tp1_multiple"]:
@@ -406,7 +454,12 @@ async def sweep_time_exits(ppclient):
 
             if elapsed >= pos["max_hold"]:
                 if reserves:
-                    await _close(mint, pos, reserves[0], reserves[1], "time_exit", ppclient)
+                    v_sol, v_tokens = reserves
+                    multiple = (v_sol / v_tokens) / pos["entry_price"]
+                    if not _is_plausible(pos, multiple):
+                        log.warning(f"[SUSPECT DATA] {mint} time_exit reserves imply {multiple:.1f}x — skipping this sweep, will retry")
+                        continue
+                    await _close(mint, pos, v_sol, v_tokens, "time_exit", ppclient)
                 continue
 
             baseline = pos.get("baseline_reserves")

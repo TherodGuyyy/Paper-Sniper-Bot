@@ -71,11 +71,22 @@ class PumpPortalClient:
         self._ever_connected = False
 
     async def run_forever(self):
+        # Sep 2026: ping_timeout was left at its 20s default, same as
+        # ping_interval — meaning any single processing delay under 20s
+        # between a ping and its pong reply looked identical to a dead
+        # connection and triggered a full reconnect. subscribeNewToken is a
+        # high-volume firehose (every pump.fun launch, not just ones being
+        # traded), so brief processing backlogs are normal, not a sign the
+        # connection actually died. Widened the tolerance rather than the
+        # check interval, so a real dead connection is still caught in a
+        # similar timeframe, just without flagging normal busy moments.
         backoff = 1
         consecutive_failures = 0
         while True:
             try:
-                async with websockets.connect(config.PUMPPORTAL_WS_URL, ping_interval=20) as ws:
+                async with websockets.connect(
+                    config.PUMPPORTAL_WS_URL, ping_interval=20, ping_timeout=40
+                ) as ws:
                     self._ws = ws
                     backoff = 1
                     consecutive_failures = 0

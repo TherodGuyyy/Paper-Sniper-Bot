@@ -85,9 +85,10 @@ async def send_partial_exit_alert(strategy, mint, fraction, realized_sol):
     await send(f"🟡 PARTIAL EXIT [{strategy}] {mint}\nsold {fraction:.0%} at target, realized: {price_feed.fmt_usd(realized_sol)}\nremainder still riding")
 
 
-async def send_trade_close_alert(strategy, mint, reason, pnl_sol, pnl_pct):
+async def send_trade_close_alert(strategy, mint, reason, pnl_sol, pnl_pct, peak_multiple=None):
     emoji = "✅" if pnl_sol and pnl_sol > 0 else "🔴"
-    await send(f"{emoji} CLOSE [{strategy}] {mint}\nreason: {reason}\npnl: {price_feed.fmt_usd(pnl_sol)} ({pnl_pct:+.1%})\n{_bal_line()}\n{_open_line()}")
+    peak_line = f"\npeak while open: {peak_multiple:.2f}x" if peak_multiple else ""
+    await send(f"{emoji} CLOSE [{strategy}] {mint}\nreason: {reason}\npnl: {price_feed.fmt_usd(pnl_sol)} ({pnl_pct:+.1%}){peak_line}\n{_bal_line()}\n{_open_line()}")
 
 
 async def send_discovery_alert(wallet: str, appearance_count: int, mints_json: str):
