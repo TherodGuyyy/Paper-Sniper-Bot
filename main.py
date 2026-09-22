@@ -145,7 +145,9 @@ async def handle_helius_events(events: list):
     already migrated venues."""
     if not config.OG_WALLET_SNIPE_ENABLED:
         return
-    for ev in helius_webhook.parse_payload(events):
+    candidates = helius_webhook.parse_payload(events)
+    log.info(f"[helius] webhook call received: {len(events)} raw event(s), {len(candidates)} matched a watched wallet buy")
+    for ev in candidates:
         wallet = ev["wallet"]
         mint = ev["mint"]
         db.touch_watchlist_wallet(wallet)
