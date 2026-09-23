@@ -166,6 +166,9 @@ def _is_plausible(pos: dict, multiple: float) -> bool:
     real price move, and is skipped rather than acted on or counted."""
     limit = pos["tp2_multiple"] * config.MAX_EXIT_MULTIPLE_SANITY_FACTOR
     return multiple <= limit
+
+
+def _compute_buy_size_sol(overrides: dict) -> float:
     """Fixed-SOL sizing was blind to account growth/drawdown. This reads
     from overrides, or falls back to the global config default, whichever
     sizing mode is active — same helper used by both the pump.fun and
