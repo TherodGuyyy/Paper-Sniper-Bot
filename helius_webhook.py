@@ -76,15 +76,32 @@ def _parse_one(tx: dict) -> dict | None:
         return None
     label = _watched_label(wallet)
 
-    # What token did the wallet RECEIVE that isn't SOL/USDC (i.e. the buy)?
+    # What token did the wallet RECEIVE that isn't SOL/a stablecoin (i.e.
+    # the buy)? Sep 2026 fix: this used to only exclude WSOL/USDC and always
+    # took received[0] — a wallet routing through an intermediate hop (e.g.
+    # SOL -> USDT -> TARGET on a multi-hop Jupiter route) can show that
+    # intermediate token as a transfer INTO the wallet's own ATA too, and it
+    # isn't necessarily last in the list, so "first non-excluded transfer"
+    # silently grabbed the intermediate hop instead of what was actually
+    # bought (confirmed live: a stuck position whose "mint" was literally
+    # the USDT mint address). Now: exclude known stable/quote mints, and if
+    # more than one candidate still remains, take the LAST — the final
+    # output of a route lands in the wallet last — rather than guessing on
+    # the first.
     received = [
         t for t in token_transfers
         if t.get("toUserAccount") == wallet
-        and t.get("mint") not in (config.WSOL_MINT, config.USDC_MINT)
+        and t.get("mint") not in (config.WSOL_MINT, config.USDC_MINT, config.USDT_MINT)
     ]
     if not received:
         return None  # this was a sell, or we didn't recognize the buy leg
-    mint = received[0]["mint"]
+    if len(received) > 1:
+        log.warning(
+            f"multiple non-stablecoin tokens received in one swap for {wallet} "
+            f"(tx={tx.get('signature')}) — treating the LAST as the actual buy "
+            f"(likely a multi-hop route), candidates={[r.get('mint') for r in received]}"
+        )
+    mint = received[-1]["mint"]
     tokens_received = float(received[0].get("tokenAmount") or 0)
     if tokens_received <= 0:
         return None

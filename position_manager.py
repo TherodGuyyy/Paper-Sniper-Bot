@@ -78,6 +78,9 @@ async def reconcile_open_positions(ppclient):
             "sl_pct": r["sl_pct"],
             "max_hold": r["max_hold_seconds"],
             "tp1_done": bool(r["tp1_done"]),
+            "tp2_sell_fraction": r["tp2_sell_fraction"],
+            "tp2_done": bool(r["tp2_done"]),
+            "runner_trail_pct": r["runner_trail_pct"],
             "realized_pnl_sol": r["realized_pnl_sol"] or 0,
             "triggered_by_wallet": r["triggered_by_wallet"],
             "baseline_reserves": None,  # not persisted — dead-token early exit just won't apply to reconciled positions, max_hold still will
@@ -158,6 +161,21 @@ def _update_peak(pos: dict, current_price: float):
         pos["peak_price"] = current_price
 
 
+def _runner_trailing_stop_hit(pos: dict, current_price: float) -> bool:
+    """Once TP2 has partially exited a position, the remainder is a
+    'runner' — instead of a fixed target, it's protected by a trailing stop
+    off its own peak so a real mover gets room to keep going while still
+    giving back the gain if it rolls over. Wallets without a
+    runner_trail_pct override never enter this path (tp2_done implies old
+    full-close-at-TP2 behavior for them)."""
+    trail_pct = pos.get("runner_trail_pct")
+    peak = pos.get("peak_price")
+    if not trail_pct or not peak:
+        return False
+    drop_from_peak = (peak - current_price) / peak
+    return drop_from_peak >= trail_pct
+
+
 def _is_plausible(pos: dict, multiple: float) -> bool:
     """See MAX_EXIT_MULTIPLE_SANITY_FACTOR in config.py for why this
     exists — a single trade tick implying a move far beyond what this
@@ -191,7 +209,15 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
     tp2_multiple = overrides.get("tp2_multiple", config.OG_TP2_MULTIPLE)
     sl_pct = overrides.get("sl_pct", config.OG_STOP_LOSS_PCT)
     max_hold_seconds = overrides.get("max_hold_seconds", config.OG_MAX_HOLD_SECONDS)
+    tp2_sell_fraction = overrides.get("tp2_sell_fraction")  # None = old full-close-at-TP2 behavior
+    runner_trail_pct = overrides.get("runner_trail_pct")
     buy_size_sol = _compute_buy_size_sol(overrides)
+
+    max_buys = overrides.get("max_buys_per_token", config.OG_MAX_BUYS_PER_TOKEN)
+    prior_buys = db.get_buy_count_for_wallet_mint(wallet_addr, mint)
+    if prior_buys >= max_buys:
+        db.log_missed("og_wallet", mint, f"already bought {prior_buys}x from {watched_wallet_label}, at max_buys_per_token={max_buys}")
+        return
 
     update_reserve_cache(mint, v_sol, v_tokens)
     try:
@@ -210,6 +236,7 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
         tp2_multiple=tp2_multiple, sl_pct=sl_pct, max_hold_seconds=max_hold_seconds,
         triggered_by_wallet=wallet_addr,
         meta_json=str({"triggered_by": watched_wallet_label}),
+        tp2_sell_fraction=tp2_sell_fraction, runner_trail_pct=runner_trail_pct,
     )
     _open_positions[mint] = {
         "id": trade_id, "strategy": "og_wallet", "entry_time": time.time(),
@@ -220,6 +247,7 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
         "tp1_done": False, "realized_pnl_sol": 0.0, "triggered_by_wallet": wallet_addr,
         "baseline_reserves": (v_sol, v_tokens),
         "peak_multiple": 1.0, "peak_price": fill.effective_price,
+        "tp2_sell_fraction": tp2_sell_fraction, "tp2_done": False, "runner_trail_pct": runner_trail_pct,
     }
     log.info(f"[OPEN og_wallet] {mint} triggered_by={watched_wallet_label} entry_price={fill.effective_price:.10f} size={buy_size_sol} (tp1={tp1_multiple}x tp2={tp2_multiple}x hold={max_hold_seconds}s)")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, fill.effective_price, buy_size_sol)
@@ -235,13 +263,31 @@ async def attempt_og_snipe_raydium(mint: str, entry_price_sol: float, wallet_add
     if mint in _open_positions:
         return
 
+    # Defensive backstop: even with helius_webhook.py's fix, never let a
+    # known stablecoin/wSOL mint reach this far — a bug upstream, or a
+    # payload shape we haven't seen yet, should fail closed here rather than
+    # open a "position" in a token that was never actually bought.
+    if mint in (config.WSOL_MINT, config.USDC_MINT, config.USDT_MINT):
+        log.warning(f"attempt_og_snipe_raydium called with a stablecoin/wSOL mint ({mint}) — refusing, this indicates an upstream parsing bug")
+        db.log_missed("og_wallet", mint, "refused: mint is a known stablecoin/wSOL, likely an upstream parsing bug")
+        return
+
+
     overrides = config.WALLET_EXIT_OVERRIDES.get(wallet_addr, {})
     tp1_multiple = overrides.get("tp1_multiple", config.OG_TP1_MULTIPLE)
     tp1_sell_fraction = overrides.get("tp1_sell_fraction", config.OG_TP1_SELL_FRACTION)
     tp2_multiple = overrides.get("tp2_multiple", config.OG_TP2_MULTIPLE)
     sl_pct = overrides.get("sl_pct", config.OG_STOP_LOSS_PCT)
     max_hold_seconds = overrides.get("max_hold_seconds", config.OG_MAX_HOLD_SECONDS)
+    tp2_sell_fraction = overrides.get("tp2_sell_fraction")
+    runner_trail_pct = overrides.get("runner_trail_pct")
     buy_size_sol = _compute_buy_size_sol(overrides)
+
+    max_buys = overrides.get("max_buys_per_token", config.OG_MAX_BUYS_PER_TOKEN)
+    prior_buys = db.get_buy_count_for_wallet_mint(wallet_addr, mint)
+    if prior_buys >= max_buys:
+        db.log_missed("og_wallet", mint, f"already bought {prior_buys}x from {watched_wallet_label}, at max_buys_per_token={max_buys}")
+        return
 
     if not entry_price_sol or entry_price_sol <= 0:
         db.log_missed("og_wallet", mint, "raydium: invalid entry price computed from webhook")
@@ -261,6 +307,7 @@ async def attempt_og_snipe_raydium(mint: str, entry_price_sol: float, wallet_add
         tp2_multiple=tp2_multiple, sl_pct=sl_pct, max_hold_seconds=max_hold_seconds,
         triggered_by_wallet=wallet_addr,
         meta_json=str({"triggered_by": watched_wallet_label, "source": source}),
+        tp2_sell_fraction=tp2_sell_fraction, runner_trail_pct=runner_trail_pct,
     )
     _open_positions[mint] = {
         "id": trade_id, "strategy": "og_wallet", "entry_time": time.time(),
@@ -271,6 +318,7 @@ async def attempt_og_snipe_raydium(mint: str, entry_price_sol: float, wallet_add
         "tp1_done": False, "realized_pnl_sol": 0.0, "triggered_by_wallet": wallet_addr,
         "baseline_reserves": None, "price_source": "raydium",
         "peak_multiple": 1.0, "peak_price": entry_price_sol,
+        "tp2_sell_fraction": tp2_sell_fraction, "tp2_done": False, "runner_trail_pct": runner_trail_pct,
     }
     log.info(f"[OPEN og_wallet_raydium] {mint} triggered_by={watched_wallet_label} entry_price={entry_price_sol:.10f} size={buy_size_sol} source={source}")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, entry_price_sol, buy_size_sol)
@@ -294,6 +342,18 @@ async def _raydium_partial_exit(mint: str, pos: dict, current_price: float):
     db.record_partial_exit(pos["id"], pos["remaining_tokens"], realized)
     log.info(f"[PARTIAL TP1 og_wallet_raydium] {mint} sold {pos['tp1_sell_fraction']:.0%} realized={realized:+.4f} SOL")
     await telegram_sender.send_partial_exit_alert(pos["strategy"], mint, pos["tp1_sell_fraction"], realized)
+
+
+async def _raydium_tp2_partial_exit(mint: str, pos: dict, current_price: float):
+    sell_tokens = pos["remaining_tokens"] * pos["tp2_sell_fraction"]
+    gross_sol_out = sell_tokens * current_price
+    realized, fee = _raydium_fill(gross_sol_out, current_price)
+    pos["remaining_tokens"] -= sell_tokens
+    pos["realized_pnl_sol"] += realized
+    pos["tp2_done"] = True
+    db.record_tp2_partial_exit(pos["id"], pos["remaining_tokens"], realized)
+    log.info(f"[PARTIAL TP2 og_wallet_raydium] {mint} sold {pos['tp2_sell_fraction']:.0%} of remainder realized={realized:+.4f} SOL — runner riding with trail={pos.get('runner_trail_pct')}")
+    await telegram_sender.send_partial_exit_alert(pos["strategy"], mint, pos["tp2_sell_fraction"], realized)
 
 
 async def _raydium_close(mint: str, pos: dict, current_price: float, reason: str):
@@ -343,8 +403,14 @@ async def raydium_price_poll_loop():
                 if current_price:
                     time_exit_multiple = current_price / pos["entry_price"]
                     if not _is_plausible(pos, time_exit_multiple):
-                        log.warning(f"[SUSPECT DATA] {mint} time_exit price implies {time_exit_multiple:.1f}x — skipping this cycle, will retry")
+                        pos["time_exit_suspect_streak"] = pos.get("time_exit_suspect_streak", 0) + 1
+                        if pos["time_exit_suspect_streak"] >= config.MAX_CONSECUTIVE_SUSPECT_RETRIES:
+                            log.warning(f"[SUSPECT DATA] {mint} time_exit price implies {time_exit_multiple:.1f}x for {pos['time_exit_suspect_streak']} straight polls — force-closing anyway, this position's data (and likely its mint) looks wrong, verify manually")
+                            await _raydium_close(mint, pos, current_price, "stale_data_force_close")
+                        else:
+                            log.warning(f"[SUSPECT DATA] {mint} time_exit price implies {time_exit_multiple:.1f}x — skipping this cycle, will retry ({pos['time_exit_suspect_streak']}/{config.MAX_CONSECUTIVE_SUSPECT_RETRIES})")
                         continue
+                    pos["time_exit_suspect_streak"] = 0
                     await _raydium_close(mint, pos, current_price, "time_exit")
                 continue
 
@@ -359,8 +425,16 @@ async def raydium_price_poll_loop():
                 continue
             _update_peak(pos, current_price)
 
-            if multiple >= pos["tp2_multiple"]:
-                await _raydium_close(mint, pos, current_price, "take_profit_2")
+            if pos.get("tp2_done"):
+                if _runner_trailing_stop_hit(pos, current_price):
+                    await _raydium_close(mint, pos, current_price, "trailing_stop_runner")
+                elif change_pct <= -pos["sl_pct"]:
+                    await _raydium_close(mint, pos, current_price, "stop_loss")
+            elif multiple >= pos["tp2_multiple"]:
+                if pos.get("tp2_sell_fraction"):
+                    await _raydium_tp2_partial_exit(mint, pos, current_price)
+                else:
+                    await _raydium_close(mint, pos, current_price, "take_profit_2")
             elif not pos["tp1_done"] and multiple >= pos["tp1_multiple"]:
                 await _raydium_partial_exit(mint, pos, current_price)
             elif change_pct <= -pos["sl_pct"]:
@@ -383,6 +457,27 @@ async def _partial_exit(mint: str, pos: dict, v_sol: float, v_tokens: float, ppc
     db.record_partial_exit(pos["id"], pos["remaining_tokens"], realized)
     log.info(f"[PARTIAL TP1 {pos['strategy']}] {mint} sold {pos['tp1_sell_fraction']:.0%} realized={realized:+.4f} SOL")
     await telegram_sender.send_partial_exit_alert(pos["strategy"], mint, pos["tp1_sell_fraction"], realized)
+
+
+async def _tp2_partial_exit(mint: str, pos: dict, v_sol: float, v_tokens: float, ppclient=None):
+    """TP2 leg of a runner position — sells tp2_sell_fraction of what's
+    left instead of closing entirely; the remainder rides under
+    runner_trail_pct from here on (see _runner_trailing_stop_hit)."""
+    sell_amount = pos["remaining_tokens"] * pos["tp2_sell_fraction"]
+    try:
+        fill = curve_math.simulate_sell(v_sol, v_tokens, sell_amount, config.PUMPFUN_FEE_PCT)
+    except ValueError as e:
+        log.warning(f"tp2 partial exit sim failed for {mint}: {e}")
+        return
+
+    exit_priority_fee = random.uniform(config.PRIORITY_FEE_SOL_MIN, config.PRIORITY_FEE_SOL_MAX)
+    realized = fill.tokens_or_sol_received - exit_priority_fee
+    pos["remaining_tokens"] -= sell_amount
+    pos["realized_pnl_sol"] += realized
+    pos["tp2_done"] = True
+    db.record_tp2_partial_exit(pos["id"], pos["remaining_tokens"], realized)
+    log.info(f"[PARTIAL TP2 {pos['strategy']}] {mint} sold {pos['tp2_sell_fraction']:.0%} of remainder realized={realized:+.4f} SOL — runner riding with trail={pos.get('runner_trail_pct')}")
+    await telegram_sender.send_partial_exit_alert(pos["strategy"], mint, pos["tp2_sell_fraction"], realized)
 
 
 async def _close(mint: str, pos: dict, v_sol: float, v_tokens: float, reason: str, ppclient=None):
@@ -438,8 +533,18 @@ async def on_trade_event(trade: dict, ppclient):
         return
     _update_peak(pos, current_price)
 
-    if multiple >= pos["tp2_multiple"]:
-        await _close(mint, pos, v_sol, v_tokens, "take_profit_2", ppclient)
+    if pos.get("tp2_done"):
+        # Runner phase: no fixed target anymore, protected by the trailing
+        # stop (or the ordinary stop-loss, whichever's tighter at this point).
+        if _runner_trailing_stop_hit(pos, current_price):
+            await _close(mint, pos, v_sol, v_tokens, "trailing_stop_runner", ppclient)
+        elif change_pct <= -pos["sl_pct"]:
+            await _close(mint, pos, v_sol, v_tokens, "stop_loss", ppclient)
+    elif multiple >= pos["tp2_multiple"]:
+        if pos.get("tp2_sell_fraction"):
+            await _tp2_partial_exit(mint, pos, v_sol, v_tokens, ppclient)
+        else:
+            await _close(mint, pos, v_sol, v_tokens, "take_profit_2", ppclient)
     elif not pos["tp1_done"] and multiple >= pos["tp1_multiple"]:
         await _partial_exit(mint, pos, v_sol, v_tokens, ppclient)
     elif change_pct <= -pos["sl_pct"]:
@@ -460,8 +565,14 @@ async def sweep_time_exits(ppclient):
                     v_sol, v_tokens = reserves
                     multiple = (v_sol / v_tokens) / pos["entry_price"]
                     if not _is_plausible(pos, multiple):
-                        log.warning(f"[SUSPECT DATA] {mint} time_exit reserves imply {multiple:.1f}x — skipping this sweep, will retry")
+                        pos["time_exit_suspect_streak"] = pos.get("time_exit_suspect_streak", 0) + 1
+                        if pos["time_exit_suspect_streak"] >= config.MAX_CONSECUTIVE_SUSPECT_RETRIES:
+                            log.warning(f"[SUSPECT DATA] {mint} time_exit reserves imply {multiple:.1f}x for {pos['time_exit_suspect_streak']} straight sweeps — force-closing anyway, this position's data (and likely its mint) looks wrong, verify manually")
+                            await _close(mint, pos, v_sol, v_tokens, "stale_data_force_close", ppclient)
+                        else:
+                            log.warning(f"[SUSPECT DATA] {mint} time_exit reserves imply {multiple:.1f}x — skipping this sweep, will retry ({pos['time_exit_suspect_streak']}/{config.MAX_CONSECUTIVE_SUSPECT_RETRIES})")
                         continue
+                    pos["time_exit_suspect_streak"] = 0
                     await _close(mint, pos, v_sol, v_tokens, "time_exit", ppclient)
                 continue
 

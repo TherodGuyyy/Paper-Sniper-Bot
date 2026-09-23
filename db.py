@@ -28,6 +28,13 @@ CREATE TABLE IF NOT EXISTS trades (
     remaining_tokens REAL,
     realized_pnl_sol REAL DEFAULT 0,
     tp1_done INTEGER DEFAULT 0,
+    -- runner tier (Sep 2026): if tp2_sell_fraction is set, hitting TP2 sells
+    -- only that fraction of what's left instead of closing the position —
+    -- the remainder becomes a "runner" protected by runner_trail_pct instead
+    -- of a fixed target. NULL tp2_sell_fraction = old behavior (full close).
+    tp2_sell_fraction REAL,
+    tp2_done INTEGER DEFAULT 0,
+    runner_trail_pct REAL,
     triggered_by_wallet TEXT,           -- for strategy='og_wallet': the watched wallet address
     exit_time REAL,
     exit_price REAL,
@@ -88,7 +95,8 @@ def init_db():
     conn.executescript(SCHEMA)
     # Migration for DBs created before peak tracking existed — CREATE TABLE
     # IF NOT EXISTS above doesn't add columns to an already-existing table.
-    for col in ("peak_price REAL", "peak_multiple REAL"):
+    for col in ("peak_price REAL", "peak_multiple REAL",
+                "tp2_sell_fraction REAL", "tp2_done INTEGER DEFAULT 0", "runner_trail_pct REAL"):
         try:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -111,19 +119,22 @@ def get_conn():
 def open_trade(strategy, mint, entry_price, entry_sol_in, entry_tokens,
                entry_price_impact_pct, entry_fee_sol, priority_fee_sol,
                tp1_multiple, tp1_sell_fraction, tp2_multiple, sl_pct, max_hold_seconds,
-               triggered_by_wallet=None, meta_json=""):
+               triggered_by_wallet=None, meta_json="",
+               tp2_sell_fraction=None, runner_trail_pct=None):
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO trades
                (strategy, mint, status, entry_time, entry_price, entry_sol_in,
                 entry_tokens, entry_price_impact_pct, entry_fee_sol, priority_fee_sol,
                 tp1_multiple, tp1_sell_fraction, tp2_multiple, sl_pct, max_hold_seconds,
-                remaining_tokens, triggered_by_wallet, meta_json)
-               VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                remaining_tokens, triggered_by_wallet, meta_json,
+                tp2_sell_fraction, runner_trail_pct)
+               VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (strategy, mint, time.time(), entry_price, entry_sol_in, entry_tokens,
              entry_price_impact_pct, entry_fee_sol, priority_fee_sol,
              tp1_multiple, tp1_sell_fraction, tp2_multiple, sl_pct, max_hold_seconds,
-             entry_tokens, triggered_by_wallet, meta_json),
+             entry_tokens, triggered_by_wallet, meta_json,
+             tp2_sell_fraction, runner_trail_pct),
         )
         return cur.lastrowid
 
@@ -144,6 +155,31 @@ def record_partial_exit(trade_id, remaining_tokens, realized_pnl_delta_sol):
                WHERE id=?""",
             (remaining_tokens, realized_pnl_delta_sol, trade_id),
         )
+
+
+def record_tp2_partial_exit(trade_id, remaining_tokens, realized_pnl_delta_sol):
+    """Same idea as record_partial_exit, but for the TP2 leg on a runner
+    position — flags tp2_done instead of tp1_done, and leaves the position
+    open (the remainder is now protected by runner_trail_pct, not a fixed
+    target)."""
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE trades SET remaining_tokens=?, realized_pnl_sol = realized_pnl_sol + ?, tp2_done=1
+               WHERE id=?""",
+            (remaining_tokens, realized_pnl_delta_sol, trade_id),
+        )
+
+
+def get_buy_count_for_wallet_mint(wallet_addr: str, mint: str) -> int:
+    """How many times we've already paper-bought this mint off this watched
+    wallet (open or closed — 'missed' attempts never actually bought, so
+    they don't count against the cap)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) c FROM trades WHERE triggered_by_wallet=? AND mint=? AND status IN ('open','closed')",
+            (wallet_addr, mint),
+        ).fetchone()
+        return row["c"]
 
 
 def close_trade(trade_id, exit_price, exit_sol_out, exit_reason, exit_fee_sol, pnl_sol, pnl_pct,

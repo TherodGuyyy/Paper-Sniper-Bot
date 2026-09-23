@@ -117,6 +117,14 @@ OG_TP2_MULTIPLE = 2.0
 OG_STOP_LOSS_PCT = 0.30
 OG_MAX_HOLD_SECONDS = 900
 
+# Cap on how many times we'll paper-buy the SAME mint from the SAME watched
+# wallet. Some wallets (meme_detective) buy into one token multiple times —
+# a single buy is often too small a signal to act on alone, but letting the
+# bot re-enter unlimited times on one token turns one wallet's habit into
+# unbounded concentrated exposure. 2 = act on repeat conviction, cap the risk.
+# Per-wallet override key: "max_buys_per_token".
+OG_MAX_BUYS_PER_TOKEN = 2
+
 # ---------------------------------------------------------------------------
 # EXIT SANITY GUARD (Sep 2026) — a real incident: a trade closed for +5854%
 # pnl on a $3.54 position, seconds after opening. Root cause: the exit path
@@ -131,6 +139,14 @@ OG_MAX_HOLD_SECONDS = 900
 # re-evaluated on the next tick instead.
 # ---------------------------------------------------------------------------
 MAX_EXIT_MULTIPLE_SANITY_FACTOR = 3.0
+
+# A position whose price reading fails the sanity check above N consecutive
+# times (e.g. mint got mismatched to a stablecoin/wrong swap leg upstream,
+# and will NEVER look plausible) used to retry forever, permanently locking
+# a concurrent-position slot. After this many consecutive suspect readings,
+# force-close it anyway at the last suspect price, flagged so the P&L on
+# that trade is understood to be unreliable, rather than leak the slot.
+MAX_CONSECUTIVE_SUSPECT_RETRIES = 6
 
 # Per-wallet exit overrides, keyed by wallet address. Any key you don't set
 # for a wallet falls back to the OG_* defaults above.
@@ -156,9 +172,19 @@ WALLET_EXIT_OVERRIDES = {
     # and leaning on fast execution instead: smaller size per trade (since
     # most individual trades are probably farms) and a tighter, faster exit
     # so no single one does much damage either way.
+    # Sep 2026 update: most of his buys are still farms and should still exit
+    # fast, but he occasionally hits something real and rides it far beyond a
+    # 1.8x fantasy exit — the old setup fully closed at TP2 no matter what,
+    # so those runners got capped at ~1.8x same as every farm. New shape:
+    # TP1 locks in half early, TP2 banks most of what's left as a solid win,
+    # and a small runner tail is kept open with a trailing stop (25% off its
+    # peak) instead of a fixed target — so a farm still dies fast, but a real
+    # mover gets room to actually run.
     "6qudAN2kV8mtCcYJxb5QQ6Vr15itdHHdeVbYm99NKMhy": {
-        "tp1_multiple": 1.3, "tp1_sell_fraction": 0.6, "tp2_multiple": 1.8,
-        "sl_pct": 0.20, "max_hold_seconds": 300,
+        "tp1_multiple": 1.5, "tp1_sell_fraction": 0.5,
+        "tp2_multiple": 2.1, "tp2_sell_fraction": 0.7,
+        "runner_trail_pct": 0.25,
+        "sl_pct": 0.30, "max_hold_seconds": 600,
         "buy_size_pct": 0.025, "max_concurrent": 3,  # was a flat 0.03 SOL — smaller %, same reasoning as before (most individual trades are probably farms)
     },
 }
@@ -187,6 +213,7 @@ WATCHED_WALLETS = {
 HELIUS_WEBHOOK_SECRET = os.environ.get("HELIUS_WEBHOOK_SECRET", "")
 
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 # Modeled fee+slippage for a Raydium/Jupiter fill — we don't get a real
