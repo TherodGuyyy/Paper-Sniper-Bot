@@ -71,6 +71,7 @@ async def reconcile_open_positions(ppclient):
             "entry_price": r["entry_price"],
             "entry_sol_in": r["entry_sol_in"],
             "remaining_tokens": r["remaining_tokens"],
+            "entry_tokens_total": r["entry_tokens"],
             "priority_fee_sol": r["priority_fee_sol"],
             "tp1_multiple": r["tp1_multiple"],
             "tp1_sell_fraction": r["tp1_sell_fraction"],
@@ -248,6 +249,7 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
         "baseline_reserves": (v_sol, v_tokens),
         "peak_multiple": 1.0, "peak_price": fill.effective_price,
         "tp2_sell_fraction": tp2_sell_fraction, "tp2_done": False, "runner_trail_pct": runner_trail_pct,
+        "entry_tokens_total": fill.tokens_or_sol_received,
     }
     log.info(f"[OPEN og_wallet] {mint} triggered_by={watched_wallet_label} entry_price={fill.effective_price:.10f} size={buy_size_sol} (tp1={tp1_multiple}x tp2={tp2_multiple}x hold={max_hold_seconds}s)")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, fill.effective_price, buy_size_sol)
@@ -319,6 +321,7 @@ async def attempt_og_snipe_raydium(mint: str, entry_price_sol: float, wallet_add
         "baseline_reserves": None, "price_source": "raydium",
         "peak_multiple": 1.0, "peak_price": entry_price_sol,
         "tp2_sell_fraction": tp2_sell_fraction, "tp2_done": False, "runner_trail_pct": runner_trail_pct,
+        "entry_tokens_total": tokens_received,
     }
     log.info(f"[OPEN og_wallet_raydium] {mint} triggered_by={watched_wallet_label} entry_price={entry_price_sol:.10f} size={buy_size_sol} source={source}")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, entry_price_sol, buy_size_sol)
@@ -356,15 +359,24 @@ async def _raydium_tp2_partial_exit(mint: str, pos: dict, current_price: float):
     await telegram_sender.send_partial_exit_alert(pos["strategy"], mint, pos["tp2_sell_fraction"], realized)
 
 
-async def _raydium_close(mint: str, pos: dict, current_price: float, reason: str):
-    gross_sol_out = pos["remaining_tokens"] * current_price
-    final_leg_pnl, fee = _raydium_fill(gross_sol_out, current_price)
+async def _raydium_close(mint: str, pos: dict, current_price: float, reason: str, data_unreliable: bool = False):
+    if data_unreliable:
+        fraction_remaining = pos["remaining_tokens"] / pos["entry_tokens_total"] if pos.get("entry_tokens_total") else 0
+        final_leg_pnl = pos["entry_sol_in"] * fraction_remaining
+        exit_price = pos["entry_price"]
+        gross_sol_out = final_leg_pnl
+        fee = 0.0
+    else:
+        gross_sol_out = pos["remaining_tokens"] * current_price
+        final_leg_pnl, fee = _raydium_fill(gross_sol_out, current_price)
+        exit_price = current_price
+
     total_pnl_sol = pos["realized_pnl_sol"] + final_leg_pnl - pos["entry_sol_in"] - pos["priority_fee_sol"]
     pnl_pct = total_pnl_sol / pos["entry_sol_in"]
 
-    db.close_trade(pos["id"], current_price, gross_sol_out, reason, fee, total_pnl_sol, pnl_pct,
+    db.close_trade(pos["id"], exit_price, gross_sol_out, reason, fee, total_pnl_sol, pnl_pct,
                     peak_price=pos.get("peak_price"), peak_multiple=pos.get("peak_multiple"))
-    log.info(f"[CLOSE og_wallet_raydium] {mint} reason={reason} pnl={total_pnl_sol:+.4f} SOL ({pnl_pct:+.1%}) peak={pos.get('peak_multiple', 1.0):.2f}x")
+    log.info(f"[CLOSE og_wallet_raydium] {mint} reason={reason} pnl={total_pnl_sol:+.4f} SOL ({pnl_pct:+.1%}) peak={pos.get('peak_multiple', 1.0):.2f}x" + (" [UNRELIABLE DATA — remainder valued at cost]" if data_unreliable else ""))
     await telegram_sender.send_trade_close_alert(pos["strategy"], mint, reason, total_pnl_sol, pnl_pct, peak_multiple=pos.get("peak_multiple"))
 
     if pos.get("triggered_by_wallet"):
@@ -406,7 +418,7 @@ async def raydium_price_poll_loop():
                         pos["time_exit_suspect_streak"] = pos.get("time_exit_suspect_streak", 0) + 1
                         if pos["time_exit_suspect_streak"] >= config.MAX_CONSECUTIVE_SUSPECT_RETRIES:
                             log.warning(f"[SUSPECT DATA] {mint} time_exit price implies {time_exit_multiple:.1f}x for {pos['time_exit_suspect_streak']} straight polls — force-closing anyway, this position's data (and likely its mint) looks wrong, verify manually")
-                            await _raydium_close(mint, pos, current_price, "stale_data_force_close")
+                            await _raydium_close(mint, pos, current_price, "stale_data_force_close", data_unreliable=True)
                         else:
                             log.warning(f"[SUSPECT DATA] {mint} time_exit price implies {time_exit_multiple:.1f}x — skipping this cycle, will retry ({pos['time_exit_suspect_streak']}/{config.MAX_CONSECUTIVE_SUSPECT_RETRIES})")
                         continue
@@ -480,23 +492,40 @@ async def _tp2_partial_exit(mint: str, pos: dict, v_sol: float, v_tokens: float,
     await telegram_sender.send_partial_exit_alert(pos["strategy"], mint, pos["tp2_sell_fraction"], realized)
 
 
-async def _close(mint: str, pos: dict, v_sol: float, v_tokens: float, reason: str, ppclient=None):
-    try:
-        fill = curve_math.simulate_sell(v_sol, v_tokens, pos["remaining_tokens"], config.PUMPFUN_FEE_PCT)
-    except ValueError as e:
-        log.warning(f"close sim failed for {mint}: {e}")
-        return
+async def _close(mint: str, pos: dict, v_sol: float, v_tokens: float, reason: str, ppclient=None, data_unreliable: bool = False):
+    if data_unreliable:
+        # Sep 2026 fix: this used to run the sell sim against v_sol/v_tokens
+        # even when those exact reserves had just been flagged as
+        # implausible by _is_plausible (that's WHY we're force-closing) —
+        # producing fabricated multi-thousand-percent "profit" out of data
+        # we already knew was garbage. Instead, value the unsold remainder
+        # at cost (net-zero contribution) and let the P&L reflect only what
+        # was actually realized via earlier partial exits on real data.
+        fraction_remaining = pos["remaining_tokens"] / pos["entry_tokens_total"] if pos.get("entry_tokens_total") else 0
+        final_leg_pnl = pos["entry_sol_in"] * fraction_remaining
+        exit_price = pos["entry_price"]
+        exit_sol_out = final_leg_pnl
+        exit_fee_sol = 0.0
+    else:
+        try:
+            fill = curve_math.simulate_sell(v_sol, v_tokens, pos["remaining_tokens"], config.PUMPFUN_FEE_PCT)
+        except ValueError as e:
+            log.warning(f"close sim failed for {mint}: {e}")
+            return
+        exit_priority_fee = random.uniform(config.PRIORITY_FEE_SOL_MIN, config.PRIORITY_FEE_SOL_MAX)
+        final_leg_pnl = fill.tokens_or_sol_received - exit_priority_fee
+        exit_price = fill.effective_price
+        exit_sol_out = fill.tokens_or_sol_received
+        exit_fee_sol = fill.fee_paid_sol
 
-    exit_priority_fee = random.uniform(config.PRIORITY_FEE_SOL_MIN, config.PRIORITY_FEE_SOL_MAX)
-    final_leg_pnl = fill.tokens_or_sol_received - exit_priority_fee
     total_pnl_sol = pos["realized_pnl_sol"] + final_leg_pnl - pos["entry_sol_in"] - pos["priority_fee_sol"]
     pnl_pct = total_pnl_sol / pos["entry_sol_in"]
 
     db.close_trade(
-        pos["id"], fill.effective_price, fill.tokens_or_sol_received, reason, fill.fee_paid_sol, total_pnl_sol, pnl_pct,
+        pos["id"], exit_price, exit_sol_out, reason, exit_fee_sol, total_pnl_sol, pnl_pct,
         peak_price=pos.get("peak_price"), peak_multiple=pos.get("peak_multiple"),
     )
-    log.info(f"[CLOSE {pos['strategy']}] {mint} reason={reason} pnl={total_pnl_sol:+.4f} SOL ({pnl_pct:+.1%}) peak={pos.get('peak_multiple', 1.0):.2f}x")
+    log.info(f"[CLOSE {pos['strategy']}] {mint} reason={reason} pnl={total_pnl_sol:+.4f} SOL ({pnl_pct:+.1%}) peak={pos.get('peak_multiple', 1.0):.2f}x" + (" [UNRELIABLE DATA — remainder valued at cost]" if data_unreliable else ""))
     await telegram_sender.send_trade_close_alert(pos["strategy"], mint, reason, total_pnl_sol, pnl_pct, peak_multiple=pos.get("peak_multiple"))
 
     if pos["strategy"] == "og_wallet" and pos.get("triggered_by_wallet"):
@@ -568,7 +597,7 @@ async def sweep_time_exits(ppclient):
                         pos["time_exit_suspect_streak"] = pos.get("time_exit_suspect_streak", 0) + 1
                         if pos["time_exit_suspect_streak"] >= config.MAX_CONSECUTIVE_SUSPECT_RETRIES:
                             log.warning(f"[SUSPECT DATA] {mint} time_exit reserves imply {multiple:.1f}x for {pos['time_exit_suspect_streak']} straight sweeps — force-closing anyway, this position's data (and likely its mint) looks wrong, verify manually")
-                            await _close(mint, pos, v_sol, v_tokens, "stale_data_force_close", ppclient)
+                            await _close(mint, pos, v_sol, v_tokens, "stale_data_force_close", ppclient, data_unreliable=True)
                         else:
                             log.warning(f"[SUSPECT DATA] {mint} time_exit reserves imply {multiple:.1f}x — skipping this sweep, will retry ({pos['time_exit_suspect_streak']}/{config.MAX_CONSECUTIVE_SUSPECT_RETRIES})")
                         continue
