@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl_pct REAL,
     peak_price REAL,      -- highest PLAUSIBLE price observed while open (see MAX_EXIT_MULTIPLE_SANITY_FACTOR)
     peak_multiple REAL,   -- that peak, expressed as a multiple of entry_price
+    window_peak_price REAL,     -- TRUE peak: highest plausible price seen within PEAK_WINDOW_SECONDS of ENTRY, even after we sold
+    window_peak_multiple REAL,  -- that true peak as a multiple of entry_price (NULL until the window ends)
     miss_reason TEXT,                   -- filled if status='missed'
     meta_json TEXT
 );
@@ -96,7 +98,8 @@ def init_db():
     # Migration for DBs created before peak tracking existed — CREATE TABLE
     # IF NOT EXISTS above doesn't add columns to an already-existing table.
     for col in ("peak_price REAL", "peak_multiple REAL",
-                "tp2_sell_fraction REAL", "tp2_done INTEGER DEFAULT 0", "runner_trail_pct REAL"):
+                "tp2_sell_fraction REAL", "tp2_done INTEGER DEFAULT 0", "runner_trail_pct REAL",
+                "window_peak_price REAL", "window_peak_multiple REAL"):
         try:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -192,6 +195,38 @@ def close_trade(trade_id, exit_price, exit_sol_out, exit_reason, exit_fee_sol, p
             (time.time(), exit_price, exit_sol_out, exit_reason, exit_fee_sol, pnl_sol, pnl_pct,
              peak_price, peak_multiple, trade_id),
         )
+
+
+def record_window_peak(trade_id, peak_price, peak_multiple):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE trades SET window_peak_price=?, window_peak_multiple=? WHERE id=?",
+            (peak_price, peak_multiple, trade_id),
+        )
+
+
+def get_trades_awaiting_window_peak(since_ts):
+    """Closed trades that opened after since_ts but never got their window
+    peak recorded (the bot restarted mid-window) — used on startup to
+    resume watching the ones whose window hasn't ended yet."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE status='closed' AND window_peak_multiple IS NULL AND entry_time >= ?",
+            (since_ts,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_window_peaks(strategy=None):
+    """Every trade that has a recorded true peak, oldest first."""
+    with get_conn() as conn:
+        q = "SELECT * FROM trades WHERE window_peak_multiple IS NOT NULL"
+        args = ()
+        if strategy:
+            q += " AND strategy=?"
+            args = (strategy,)
+        rows = conn.execute(q + " ORDER BY entry_time", args).fetchall()
+        return [dict(r) for r in rows]
 
 
 def get_open_trades(strategy=None):

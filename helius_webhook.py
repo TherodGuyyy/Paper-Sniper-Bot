@@ -40,10 +40,13 @@ def _addrs_in_transfer_list(transfers: list, key_a: str, key_b: str) -> set:
 
 
 def parse_payload(events: list[dict]) -> list[dict]:
-    """Returns a list of candidate buy events:
-    {wallet, label, mint, entry_price_sol, sol_in, tx_sig, source}
-    One entry per detected watched-wallet BUY swap. Callers still apply
-    their own gating (enabled flag, concurrency caps, etc) before acting."""
+    """Returns a list of candidate buy/sell events:
+    {wallet, label, mint, action, tx_sig, source, ...}
+    action='buy' entries also carry entry_price_sol/sol_in (as before).
+    action='sell' entries carry tokens_sold (for logging only — the actual
+    close values our own remaining_tokens against a fresh price, not what
+    HE received). One entry per detected watched-wallet swap. Callers still
+    apply their own gating (enabled flag, concurrency caps, etc) before acting."""
     out = []
     for tx in events or []:
         try:
@@ -94,7 +97,24 @@ def _parse_one(tx: dict) -> dict | None:
         and t.get("mint") not in (config.WSOL_MINT, config.USDC_MINT, config.USDT_MINT)
     ]
     if not received:
-        return None  # this was a sell, or we didn't recognize the buy leg
+        # Not a buy — check whether it's the wallet SELLING a non-stable
+        # token (sent it out, got SOL/USDC back). Needed for copy-sell-exit
+        # (WALLET_EXIT_OVERRIDES[...]["copy_wallet_sell_exit"]): we don't
+        # care what he received, only that he exited, so this branch skips
+        # straight to identifying the mint and returning a 'sell' candidate.
+        sent = [
+            t for t in token_transfers
+            if t.get("fromUserAccount") == wallet
+            and t.get("mint") not in (config.WSOL_MINT, config.USDC_MINT, config.USDT_MINT)
+        ]
+        if not sent:
+            return None  # neither leg recognizable — not a buy or a sell we can act on
+        mint = sent[-1]["mint"]
+        tokens_sold = float(sent[-1].get("tokenAmount") or 0)
+        return {
+            "wallet": wallet, "label": label, "mint": mint, "action": "sell",
+            "tokens_sold": tokens_sold, "tx_sig": tx.get("signature"), "source": source,
+        }
     if len(received) > 1:
         log.warning(
             f"multiple non-stablecoin tokens received in one swap for {wallet} "
@@ -133,6 +153,7 @@ def _parse_one(tx: dict) -> dict | None:
         "wallet": wallet,
         "label": label,
         "mint": mint,
+        "action": "buy",
         "entry_price_sol": entry_price_sol,
         "sol_in": sol_in,
         "tx_sig": tx.get("signature"),

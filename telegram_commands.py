@@ -11,6 +11,7 @@ Commands:
   /setbalance <amount>  - set paper balance to a specific $ amount (e.g. /setbalance 25)
   /status               - show open position counts
   /reset                - wipe all paper trades and stats back to a clean balance (same as reset.py, but from Telegram)
+  /peaks [wallet_label]  - true-peak stats (avg/median X, hit-rate at common thresholds) for closed windows, all wallets or one
 """
 
 import asyncio
@@ -84,6 +85,33 @@ async def _handle_command(text: str):
             f"Open positions: {n_launch}/{config.MAX_CONCURRENT_LAUNCH_POSITIONS} launch, "
             f"{n_og}/{config.MAX_CONCURRENT_OG_POSITIONS} og_wallet\n"
             f"Balance: {price_feed.fmt_usd(db.get_current_balance_sol())}"
+        )
+
+    elif cmd == "/peaks":
+        rows = db.get_window_peaks()
+        if len(parts) >= 2:
+            label_filter = parts[1].lower()
+            rows = [r for r in rows if (r.get("meta_json") or "").lower().find(label_filter) >= 0 or label_filter in (r.get("triggered_by_wallet") or "").lower()]
+        if not rows:
+            await telegram_sender.send("No completed peak windows yet — they land ~PEAK_WINDOW_SECONDS after each trade opens.")
+            return
+        multiples = [r["window_peak_multiple"] for r in rows if r.get("window_peak_multiple")]
+        if not multiples:
+            await telegram_sender.send("No completed peak windows yet.")
+            return
+        n = len(multiples)
+        avg = sum(multiples) / n
+        srt = sorted(multiples)
+        median = srt[n // 2] if n % 2 else (srt[n // 2 - 1] + srt[n // 2]) / 2
+        thresholds = [1.2, 1.3, 1.5, 1.8, 2.0, 2.5, 3.0]
+        hit_lines = "\n".join(
+            f"  ≥{t}x: {sum(1 for m in multiples if m >= t)}/{n} ({sum(1 for m in multiples if m >= t)/n:.0%})"
+            for t in thresholds
+        )
+        await telegram_sender.send(
+            f"📊 True peaks — {n} window(s) complete\n"
+            f"avg: {avg:.2f}x | median: {median:.2f}x | best: {max(multiples):.2f}x\n"
+            f"{hit_lines}"
         )
 
     elif cmd == "/reset":

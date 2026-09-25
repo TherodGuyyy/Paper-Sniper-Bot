@@ -185,7 +185,19 @@ WALLET_EXIT_OVERRIDES = {
         "tp2_multiple": 2.1, "tp2_sell_fraction": 0.7,
         "runner_trail_pct": 0.25,
         "sl_pct": 0.30, "max_hold_seconds": 600,
-        "buy_size_pct": 0.025, "max_concurrent": 3,  # was a flat 0.03 SOL — smaller %, same reasoning as before (most individual trades are probably farms)
+        # Sep 2026: bumped 0.025 -> 0.125 (2.5% -> 12.5% of balance, ~$2.5 on
+        # a $20 balance) — small trades were getting shredded by fixed-cost
+        # priority fees (a $1.15 trade eats ~35% of itself in fees alone,
+        # same fee regardless of size). NOTE: 12.5% x max_concurrent=3 means
+        # up to ~37.5% of balance can be in Meme Detective trades at once —
+        # intentional per your ask, but worth watching balance closely for
+        # the first few days at this size.
+        "buy_size_pct": 0.125, "max_concurrent": 3,
+        # Sep 2026: copy his own sell instead of relying on TP/SL. On these
+        # low-cap tokens HIS sell is often the dump — our stop-loss checks
+        # on a delay (trade-tick or 5s sweep) and can fill well past -30%
+        # by the time it reacts. If he's flat, we should be flat too.
+        "copy_wallet_sell_exit": True,
     },
 }
 
@@ -257,6 +269,30 @@ DISCOVERY_MIN_APPEARANCES = 2          # a wallet needs to show up as an early b
 # sum of all closed trades' pnl_sol. Real trades never touch this, it's just
 # so the numbers read like a real account instead of isolated trade tickets.
 STARTING_BALANCE_SOL = 5.0
+
+# ---------------------------------------------------------------------------
+# TRUE-PEAK TRACKING (Sep 2026) — the old "peak while open" number stops the
+# moment the bot sells, so a token that keeps running after we're out (or
+# that the bot got stopped out of right before a big move) looked far
+# weaker than it really was. Now, from the moment a position OPENS, the bot
+# keeps watching that token's price for this many seconds no matter what
+# the position does (sold, stopped out, still open) and records the
+# highest price seen in that window as the token's real peak. Reported in
+# Telegram when the window ends, saved on the trade (window_peak_multiple),
+# and summarized by the /peaks command. This is measuring only — it never
+# changes when the bot buys or sells.
+# 600 = 10 minutes after entry. Raise it (e.g. 1800 = 30 min) to see how
+# far his slower runners really go.
+# ---------------------------------------------------------------------------
+PEAK_WINDOW_SECONDS = 600
+
+# Protection against a single garbage price reading (e.g. a glitchy tick
+# right at a pump.fun -> Raydium migration) inflating a peak: one reading
+# more than this many times higher than the last accepted one is ignored.
+# If 3 readings in a row all agree on the new higher level, it's treated as
+# a real move and accepted. 4.0 = "ignore a sudden 4x+ jump in a single
+# reading unless it keeps showing up".
+PEAK_WINDOW_MAX_TICK_JUMP = 4.0
 
 SHOW_USD = True  # show a $ estimate alongside SOL amounts, using a cached SOL/USD price
 SOL_PRICE_REFRESH_SECONDS = 300  # how often to refresh the cached SOL/USD price

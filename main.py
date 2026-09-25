@@ -117,6 +117,12 @@ async def on_account_trade(trade: dict):
 
     label = next((lbl for lbl, addr in config.WATCHED_WALLETS.items() if addr == wallet), wallet[:8])
 
+    if trade.get("tx_type") == "sell":
+        # Copy-sell exit (pump.fun path): if we're mirroring this wallet on
+        # this mint and WALLET_EXIT_OVERRIDES has copy_wallet_sell_exit set,
+        # close our whole position now instead of waiting on TP/SL.
+        await position_manager.on_wallet_sell_signal(wallet, trade["mint"], ppclient)
+        return
     if trade.get("tx_type") != "buy":
         return
     if position_manager.count_open("og_wallet") >= config.MAX_CONCURRENT_OG_POSITIONS:
@@ -146,11 +152,18 @@ async def handle_helius_events(events: list):
     if not config.OG_WALLET_SNIPE_ENABLED:
         return
     candidates = helius_webhook.parse_payload(events)
-    log.info(f"[helius] webhook call received: {len(events)} raw event(s), {len(candidates)} matched a watched wallet buy")
+    log.info(f"[helius] webhook call received: {len(events)} raw event(s), {len(candidates)} matched a watched wallet buy/sell")
     for ev in candidates:
         wallet = ev["wallet"]
         mint = ev["mint"]
         db.touch_watchlist_wallet(wallet)
+
+        if ev.get("action") == "sell":
+            # Copy-sell exit (raydium/jupiter path) — mirror of the
+            # pump.fun branch in on_account_trade above.
+            log.info(f"[helius] {ev['label']} sold {mint} on {ev['source']}")
+            await position_manager.on_wallet_sell_signal(wallet, mint)
+            continue
 
         if position_manager.count_open("og_wallet") >= config.MAX_CONCURRENT_OG_POSITIONS:
             db.log_missed("og_wallet", mint, "at MAX_CONCURRENT_OG_POSITIONS cap (raydium)")
@@ -223,6 +236,7 @@ async def main():
         ppclient.run_forever(),
         position_manager.sweep_time_exits(ppclient),
         position_manager.raydium_price_poll_loop(),
+        position_manager.peak_window_sweep(ppclient),
         daily_summary_loop(),
         successor_check_loop(),
         price_feed.refresh_loop(),

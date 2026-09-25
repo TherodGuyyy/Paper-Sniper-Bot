@@ -91,6 +91,14 @@ async def send_trade_close_alert(strategy, mint, reason, pnl_sol, pnl_pct, peak_
     await send(f"{emoji} CLOSE [{strategy}] {mint}\nreason: {reason}\npnl: {price_feed.fmt_usd(pnl_sol)} ({pnl_pct:+.1%}){peak_line}\n{_bal_line()}\n{_open_line()}")
 
 
+async def send_window_peak_alert(label: str, mint: str, peak_multiple: float):
+    await send(
+        f"📈 TRUE PEAK [{label}] {mint}\n"
+        f"reached {peak_multiple:.2f}x within {config.PEAK_WINDOW_SECONDS // 60}min of entry "
+        f"(this is measured only — doesn't reflect what the bot actually captured)"
+    )
+
+
 async def send_discovery_alert(wallet: str, appearance_count: int, mints_json: str):
     await send(
         f"🔎 DISCOVERY: candidate wallet found\n"

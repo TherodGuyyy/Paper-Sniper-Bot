@@ -34,6 +34,12 @@ _open_positions: dict[str, dict] = {}
 # window, used for the fast early-buyer-interest check
 _pending_buyers: dict[str, set] = {}
 
+# mint -> {"trade_id","entry_price","deadline","peak_price","peak_multiple",
+# "price_source","label","suspect_streak"} — tracks a token's REAL peak for
+# PEAK_WINDOW_SECONDS after entry, independent of whether OUR position is
+# still open. See config.PEAK_WINDOW_SECONDS.
+_peak_windows: dict[str, dict] = {}
+
 
 def count_open(strategy: str) -> int:
     return len([p for p in _open_positions.values() if p["strategy"] == strategy])
@@ -150,6 +156,7 @@ async def attempt_launch_snipe(new_token: dict, ppclient):
         "baseline_reserves": (v_sol, v_tokens),
         "peak_multiple": 1.0, "peak_price": fill.effective_price,
     }
+    _register_peak_window(mint, trade_id, fill.effective_price, "curve", "launch")
     log.info(f"[OPEN launch] {mint} entry_price={fill.effective_price:.10f} impact={fill.price_impact_pct:.1%}")
     await telegram_sender.send_trade_open_alert("launch", mint, fill.effective_price, config.LAUNCH_BUY_SIZE_SOL)
     return trade_id
@@ -185,6 +192,62 @@ def _is_plausible(pos: dict, multiple: float) -> bool:
     real price move, and is skipped rather than acted on or counted."""
     limit = pos["tp2_multiple"] * config.MAX_EXIT_MULTIPLE_SANITY_FACTOR
     return multiple <= limit
+
+
+def _register_peak_window(mint: str, trade_id: int, entry_price: float, price_source: str, label: str):
+    if not config.PEAK_WINDOW_SECONDS:
+        return
+    _peak_windows[mint] = {
+        "trade_id": trade_id, "entry_price": entry_price,
+        "deadline": time.time() + config.PEAK_WINDOW_SECONDS,
+        "peak_price": entry_price, "peak_multiple": 1.0,
+        "price_source": price_source, "label": label, "suspect_streak": 0,
+    }
+
+
+def _feed_peak_window(mint: str, current_price):
+    """Feed a fresh price tick into the true-peak tracker for `mint`, if
+    it's within its window. Safe to call for any mint — a no-op if there's
+    no active window for it. A single-tick jump beyond
+    PEAK_WINDOW_MAX_TICK_JUMP is treated as suspect data (same idea as
+    _is_plausible) and needs to repeat 3x before being accepted, so one bad
+    reading near a migration boundary can't fake a huge peak."""
+    w = _peak_windows.get(mint)
+    if not w or not current_price:
+        return
+    multiple = current_price / w["entry_price"]
+    if multiple > w["peak_multiple"] * config.PEAK_WINDOW_MAX_TICK_JUMP:
+        w["suspect_streak"] += 1
+        if w["suspect_streak"] < 3:
+            return
+    else:
+        w["suspect_streak"] = 0
+    if multiple > w["peak_multiple"]:
+        w["peak_multiple"] = multiple
+        w["peak_price"] = current_price
+
+
+async def peak_window_sweep(ppclient=None):
+    """Runs independently of TP/SL/open-position state: keeps watching
+    every recently-opened token's price for PEAK_WINDOW_SECONDS after
+    ENTRY (fed by on_trade_event for pump.fun mints, and by
+    raydium_price_poll_loop for raydium mints), so trades report the
+    token's real peak — not just the peak before the bot happened to sell.
+    Also the only place that unsubscribes a pump.fun mint's trade stream
+    once BOTH the position is closed AND its peak window has ended."""
+    while True:
+        await asyncio.sleep(5)
+        now = time.time()
+        for mint in list(_peak_windows.keys()):
+            w = _peak_windows[mint]
+            if now < w["deadline"]:
+                continue
+            db.record_window_peak(w["trade_id"], w["peak_price"], w["peak_multiple"])
+            log.info(f"[TRUE PEAK] {mint} ({w['label']}) peaked at {w['peak_multiple']:.2f}x within {config.PEAK_WINDOW_SECONDS}s of entry")
+            await telegram_sender.send_window_peak_alert(w["label"], mint, w["peak_multiple"])
+            del _peak_windows[mint]
+            if ppclient and mint not in _open_positions:
+                await ppclient.unsubscribe_mint_trades(mint)
 
 
 def _compute_buy_size_sol(overrides: dict) -> float:
@@ -251,6 +314,7 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
         "tp2_sell_fraction": tp2_sell_fraction, "tp2_done": False, "runner_trail_pct": runner_trail_pct,
         "entry_tokens_total": fill.tokens_or_sol_received,
     }
+    _register_peak_window(mint, trade_id, fill.effective_price, "curve", watched_wallet_label)
     log.info(f"[OPEN og_wallet] {mint} triggered_by={watched_wallet_label} entry_price={fill.effective_price:.10f} size={buy_size_sol} (tp1={tp1_multiple}x tp2={tp2_multiple}x hold={max_hold_seconds}s)")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, fill.effective_price, buy_size_sol)
     return trade_id
@@ -323,6 +387,7 @@ async def attempt_og_snipe_raydium(mint: str, entry_price_sol: float, wallet_add
         "tp2_sell_fraction": tp2_sell_fraction, "tp2_done": False, "runner_trail_pct": runner_trail_pct,
         "entry_tokens_total": tokens_received,
     }
+    _register_peak_window(mint, trade_id, entry_price_sol, "raydium", watched_wallet_label)
     log.info(f"[OPEN og_wallet_raydium] {mint} triggered_by={watched_wallet_label} entry_price={entry_price_sol:.10f} size={buy_size_sol} source={source}")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, entry_price_sol, buy_size_sol)
     return trade_id
@@ -395,15 +460,23 @@ async def raydium_price_poll_loop():
     while True:
         await asyncio.sleep(config.RAYDIUM_PRICE_POLL_SECONDS)
         now = time.time()
-        raydium_mints = [
+        open_raydium_mints = {
             mint for mint, pos in _open_positions.items()
             if pos.get("price_source") == "raydium"
-        ]
+        }
+        peak_window_raydium_mints = {
+            mint for mint, w in _peak_windows.items()
+            if w.get("price_source") == "raydium"
+        }
+        raydium_mints = list(open_raydium_mints | peak_window_raydium_mints)
         if not raydium_mints:
             continue
         prices = await price_feed.get_jupiter_prices_sol(raydium_mints)
 
-        for mint in raydium_mints:
+        for mint in peak_window_raydium_mints:
+            _feed_peak_window(mint, prices.get(mint))
+
+        for mint in open_raydium_mints:
             pos = _open_positions.get(mint)
             if not pos:
                 continue  # closed by another path mid-loop
@@ -532,9 +605,41 @@ async def _close(mint: str, pos: dict, v_sol: float, v_tokens: float, reason: st
         db.record_wallet_trade_result(pos["triggered_by_wallet"], "", total_pnl_sol)
 
     del _open_positions[mint]
-    if ppclient:
+    if ppclient and mint not in _peak_windows:
         await ppclient.unsubscribe_mint_trades(mint)
     return total_pnl_sol, pnl_pct, reason
+
+
+async def on_wallet_sell_signal(wallet: str, mint: str, ppclient=None):
+    """Called whenever a watched wallet sells — pump.fun sells arrive via
+    on_account_trade in main.py, raydium/jupiter sells via the Helius
+    webhook. If we have an open position on this exact mint that this exact
+    wallet triggered, AND that wallet's WALLET_EXIT_OVERRIDES entry sets
+    copy_wallet_sell_exit, close our whole remaining position right now
+    instead of waiting for TP/SL/time-exit to catch up. On a low-cap token
+    his own sell often IS the dump, and our normal exits (a trade-tick check
+    or a 5s sweep) can fill well past a -30% stop by the time they react."""
+    pos = _open_positions.get(mint)
+    if not pos or pos.get("triggered_by_wallet") != wallet:
+        return
+    overrides = config.WALLET_EXIT_OVERRIDES.get(wallet, {})
+    if not overrides.get("copy_wallet_sell_exit"):
+        return
+
+    if pos.get("price_source") == "raydium":
+        prices = await price_feed.get_jupiter_prices_sol([mint])
+        current_price = prices.get(mint)
+        if not current_price:
+            log.warning(f"[wallet_sell_copy] {mint}: wallet sold but no Jupiter price available this instant — falling back to normal exits")
+            return
+        await _raydium_close(mint, pos, current_price, "wallet_sell_copy")
+    else:
+        reserves = get_latest_reserves(mint)
+        if not reserves:
+            log.warning(f"[wallet_sell_copy] {mint}: wallet sold but no reserve data cached — falling back to normal exits")
+            return
+        v_sol, v_tokens = reserves
+        await _close(mint, pos, v_sol, v_tokens, "wallet_sell_copy", ppclient)
 
 
 async def on_trade_event(trade: dict, ppclient):
@@ -544,6 +649,9 @@ async def on_trade_event(trade: dict, ppclient):
 
     if mint in _pending_buyers and trade.get("tx_type") == "buy" and trade.get("trader"):
         _pending_buyers[mint].add(trade["trader"])
+
+    if mint in _peak_windows and trade.get("v_sol") and trade.get("v_tokens"):
+        _feed_peak_window(mint, trade["v_sol"] / trade["v_tokens"])
 
     pos = _open_positions.get(mint)
     if not pos:
