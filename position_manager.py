@@ -205,13 +205,24 @@ def _register_peak_window(mint: str, trade_id: int, entry_price: float, price_so
     }
 
 
-def _feed_peak_window(mint: str, current_price):
+async def _feed_peak_window(mint: str, current_price):
     """Feed a fresh price tick into the true-peak tracker for `mint`, if
     it's within its window. Safe to call for any mint — a no-op if there's
     no active window for it. A single-tick jump beyond
     PEAK_WINDOW_MAX_TICK_JUMP is treated as suspect data (same idea as
     _is_plausible) and needs to repeat 3x before being accepted, so one bad
-    reading near a migration boundary can't fake a huge peak."""
+    reading near a migration boundary can't fake a huge peak.
+
+    Sep 2026 fix: 3 consistent same-feed readings agreeing isn't actually
+    proof they're real — a near-drained pool right after a pump.fun
+    migration can sit at a corrupted ratio for several ticks in a row,
+    which is exactly how a couple of confirmed false readings (911x, 854x)
+    got through this filter. So for a curve-sourced (pump.fun) mint, once a
+    big jump clears the 3-tick bar, it's now cross-checked against a live
+    Jupiter quote (an independent source) before being trusted — but only
+    if Jupiter actually has a route for it; pre-migration tokens legitimately
+    aren't on Jupiter yet, so no quote just means no cross-check is possible
+    and the old 3-tick behavior stands."""
     w = _peak_windows.get(mint)
     if not w or not current_price:
         return
@@ -220,6 +231,13 @@ def _feed_peak_window(mint: str, current_price):
         w["suspect_streak"] += 1
         if w["suspect_streak"] < 3:
             return
+        if w["price_source"] == "curve":
+            jup_price = (await price_feed.get_jupiter_prices_sol([mint])).get(mint)
+            if jup_price:
+                jup_multiple = jup_price / w["entry_price"]
+                if jup_multiple < multiple * 0.5:
+                    log.warning(f"[PEAK CROSS-CHECK FAILED] {mint}: curve implies {multiple:.1f}x but Jupiter only shows {jup_multiple:.1f}x — treating curve reading as corrupted (likely a near-drained pool), not accepting")
+                    return
     else:
         w["suspect_streak"] = 0
     if multiple > w["peak_multiple"]:
@@ -401,6 +419,8 @@ def _raydium_fill(sol_amount: float, price: float):
 
 
 async def _raydium_partial_exit(mint: str, pos: dict, current_price: float):
+    """Raydium counterpart of _partial_exit — same rule: never call with
+    tp1_sell_fraction >= 1.0, route that to _raydium_close instead."""
     sell_tokens = pos["remaining_tokens"] * pos["tp1_sell_fraction"]
     gross_sol_out = sell_tokens * current_price
     realized, fee = _raydium_fill(gross_sol_out, current_price)
@@ -474,7 +494,7 @@ async def raydium_price_poll_loop():
         prices = await price_feed.get_jupiter_prices_sol(raydium_mints)
 
         for mint in peak_window_raydium_mints:
-            _feed_peak_window(mint, prices.get(mint))
+            await _feed_peak_window(mint, prices.get(mint))
 
         for mint in open_raydium_mints:
             pos = _open_positions.get(mint)
@@ -521,12 +541,24 @@ async def raydium_price_poll_loop():
                 else:
                     await _raydium_close(mint, pos, current_price, "take_profit_2")
             elif not pos["tp1_done"] and multiple >= pos["tp1_multiple"]:
-                await _raydium_partial_exit(mint, pos, current_price)
+                if pos["tp1_sell_fraction"] >= 1.0:
+                    # Fixed 100%-at-TP1 exit — a real close, not a partial
+                    # (see _partial_exit's docstring note below for why this
+                    # branch exists at all).
+                    await _raydium_close(mint, pos, current_price, "take_profit_1")
+                else:
+                    await _raydium_partial_exit(mint, pos, current_price)
             elif change_pct <= -pos["sl_pct"]:
                 await _raydium_close(mint, pos, current_price, "stop_loss")
 
 
 async def _partial_exit(mint: str, pos: dict, v_sol: float, v_tokens: float, ppclient=None):
+    """TP1 leg of a LADDERED exit — sells tp1_sell_fraction and marks
+    tp1_done=True, but deliberately does NOT touch _open_positions/db
+    close-out, since a TP2 or trailing-runner leg is assumed to close things
+    out later. NEVER call this with tp1_sell_fraction >= 1.0 — callers must
+    route a fixed 100%-at-TP1 exit to _close() instead (see the callers in
+    on_trade_event / raydium_price_poll_loop)."""
     sell_amount = pos["remaining_tokens"] * pos["tp1_sell_fraction"]
     try:
         fill = curve_math.simulate_sell(v_sol, v_tokens, sell_amount, config.PUMPFUN_FEE_PCT)
@@ -618,7 +650,20 @@ async def on_wallet_sell_signal(wallet: str, mint: str, ppclient=None):
     copy_wallet_sell_exit, close our whole remaining position right now
     instead of waiting for TP/SL/time-exit to catch up. On a low-cap token
     his own sell often IS the dump, and our normal exits (a trade-tick check
-    or a 5s sweep) can fill well past a -30% stop by the time they react."""
+    or a 5s sweep) can fill well past a -30% stop by the time they react.
+
+    Sep 2026 fix: this used to close straight off get_latest_reserves() /
+    a fresh Jupiter quote with NO plausibility check at all — unlike every
+    other exit path (on_trade_event, raydium_price_poll_loop), which all
+    run _is_plausible() first. That gap produced a real, confirmed bug: a
+    $1.42 position closing at +14287% because the cached pump.fun reserves
+    were stale/near-drained (classic migration-boundary garbage — the same
+    failure mode MAX_EXIT_MULTIPLE_SANITY_FACTOR exists for), while the
+    true-peak tracker correctly showed 1.00x (no live trade ticks ever
+    confirmed any real price move). Both branches below now run the same
+    sanity check as every other exit path, and fall back to closing with
+    data_unreliable=True (values the unsold remainder at cost, flags the
+    trade) instead of trusting a number that looks fabricated."""
     pos = _open_positions.get(mint)
     if not pos or pos.get("triggered_by_wallet") != wallet:
         return
@@ -632,6 +677,11 @@ async def on_wallet_sell_signal(wallet: str, mint: str, ppclient=None):
         if not current_price:
             log.warning(f"[wallet_sell_copy] {mint}: wallet sold but no Jupiter price available this instant — falling back to normal exits")
             return
+        multiple = current_price / pos["entry_price"]
+        if not _is_plausible(pos, multiple):
+            log.warning(f"[wallet_sell_copy] {mint}: Jupiter price implies {multiple:.1f}x — looks like a bad/thin-liquidity reading, closing with data_unreliable=True instead of trusting it")
+            await _raydium_close(mint, pos, current_price, "wallet_sell_copy", data_unreliable=True)
+            return
         await _raydium_close(mint, pos, current_price, "wallet_sell_copy")
     else:
         reserves = get_latest_reserves(mint)
@@ -639,6 +689,14 @@ async def on_wallet_sell_signal(wallet: str, mint: str, ppclient=None):
             log.warning(f"[wallet_sell_copy] {mint}: wallet sold but no reserve data cached — falling back to normal exits")
             return
         v_sol, v_tokens = reserves
+        if not v_sol or not v_tokens:
+            log.warning(f"[wallet_sell_copy] {mint}: cached reserves incomplete (v_sol={v_sol} v_tokens={v_tokens}) — falling back to normal exits")
+            return
+        multiple = (v_sol / v_tokens) / pos["entry_price"]
+        if not _is_plausible(pos, multiple):
+            log.warning(f"[wallet_sell_copy] {mint}: cached reserve data implies {multiple:.1f}x — looks stale/corrupted (likely a migration-boundary artifact, same as the confirmed 14287% bug), closing with data_unreliable=True instead of trusting it")
+            await _close(mint, pos, v_sol, v_tokens, "wallet_sell_copy", ppclient, data_unreliable=True)
+            return
         await _close(mint, pos, v_sol, v_tokens, "wallet_sell_copy", ppclient)
 
 
@@ -651,7 +709,7 @@ async def on_trade_event(trade: dict, ppclient):
         _pending_buyers[mint].add(trade["trader"])
 
     if mint in _peak_windows and trade.get("v_sol") and trade.get("v_tokens"):
-        _feed_peak_window(mint, trade["v_sol"] / trade["v_tokens"])
+        await _feed_peak_window(mint, trade["v_sol"] / trade["v_tokens"])
 
     pos = _open_positions.get(mint)
     if not pos:
@@ -683,7 +741,20 @@ async def on_trade_event(trade: dict, ppclient):
         else:
             await _close(mint, pos, v_sol, v_tokens, "take_profit_2", ppclient)
     elif not pos["tp1_done"] and multiple >= pos["tp1_multiple"]:
-        await _partial_exit(mint, pos, v_sol, v_tokens, ppclient)
+        if pos["tp1_sell_fraction"] >= 1.0:
+            # Fixed 100%-at-TP1 exit — must be a real close (db.close_trade,
+            # close alert, freed concurrency slot, unsubscribe), not a
+            # "partial" exit that sells everything but never marks the
+            # position closed. _partial_exit only ever reduces
+            # remaining_tokens and sets tp1_done=True — it was written
+            # assuming a TP2/trailing-runner leg always follows to actually
+            # close things out. With no second leg, selling 100% here and
+            # leaving the position "open" with 0 tokens would permanently
+            # occupy a concurrency slot and crash the next price tick trying
+            # to sell 0 tokens (curve_math.simulate_sell rejects that).
+            await _close(mint, pos, v_sol, v_tokens, "take_profit_1", ppclient)
+        else:
+            await _partial_exit(mint, pos, v_sol, v_tokens, ppclient)
     elif change_pct <= -pos["sl_pct"]:
         await _close(mint, pos, v_sol, v_tokens, "stop_loss", ppclient)
 

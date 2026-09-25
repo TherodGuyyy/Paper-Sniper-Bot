@@ -172,18 +172,19 @@ WALLET_EXIT_OVERRIDES = {
     # and leaning on fast execution instead: smaller size per trade (since
     # most individual trades are probably farms) and a tighter, faster exit
     # so no single one does much damage either way.
-    # Sep 2026 update: most of his buys are still farms and should still exit
-    # fast, but he occasionally hits something real and rides it far beyond a
-    # 1.8x fantasy exit — the old setup fully closed at TP2 no matter what,
-    # so those runners got capped at ~1.8x same as every farm. New shape:
-    # TP1 locks in half early, TP2 banks most of what's left as a solid win,
-    # and a small runner tail is kept open with a trailing stop (25% off its
-    # peak) instead of a fixed target — so a farm still dies fast, but a real
-    # mover gets room to actually run.
+    # Sep 2026, round 2 — went ladder (TP1 half at 1.5x, TP2 most of the
+    # rest at 2.1x, a small trailing runner tail) then reverted to a SINGLE
+    # FIXED EXIT at 1.5x, 100% out, no moonbag. Why: the true-peak window
+    # data (26 clean samples, 2 suspect 900x-ish reserve-glitch readings
+    # excluded — see chat) showed 58% of tokens reach 1.5x and it's solidly
+    # past fee-breakeven (~+23% net at avg fee draw) — but on a small,
+    # still-growing balance with only a day or two of data to trust,
+    # realizing that win fully beats leaving a tail exposed hoping for a
+    # runner. Revisit going back to a scaled ladder + moonbag once the
+    # balance has grown enough that giving back an occasional big win
+    # doesn't set the whole plan back.
     "6qudAN2kV8mtCcYJxb5QQ6Vr15itdHHdeVbYm99NKMhy": {
-        "tp1_multiple": 1.5, "tp1_sell_fraction": 0.5,
-        "tp2_multiple": 2.1, "tp2_sell_fraction": 0.7,
-        "runner_trail_pct": 0.25,
+        "tp1_multiple": 1.5, "tp1_sell_fraction": 1.0,
         "sl_pct": 0.30, "max_hold_seconds": 600,
         # Sep 2026: bumped 0.025 -> 0.125 (2.5% -> 12.5% of balance, ~$2.5 on
         # a $20 balance) — small trades were getting shredded by fixed-cost
