@@ -156,7 +156,7 @@ async def attempt_launch_snipe(new_token: dict, ppclient):
         "baseline_reserves": (v_sol, v_tokens),
         "peak_multiple": 1.0, "peak_price": fill.effective_price,
     }
-    _register_peak_window(mint, trade_id, fill.effective_price, "curve", "launch")
+    _register_peak_window(mint, trade_id, fill.effective_price, "curve", "launch", config.TP2_MULTIPLE)
     log.info(f"[OPEN launch] {mint} entry_price={fill.effective_price:.10f} impact={fill.price_impact_pct:.1%}")
     await telegram_sender.send_trade_open_alert("launch", mint, fill.effective_price, config.LAUNCH_BUY_SIZE_SOL)
     return trade_id
@@ -194,7 +194,7 @@ def _is_plausible(pos: dict, multiple: float) -> bool:
     return multiple <= limit
 
 
-def _register_peak_window(mint: str, trade_id: int, entry_price: float, price_source: str, label: str):
+def _register_peak_window(mint: str, trade_id: int, entry_price: float, price_source: str, label: str, tp2_multiple: float):
     if not config.PEAK_WINDOW_SECONDS:
         return
     _peak_windows[mint] = {
@@ -202,6 +202,10 @@ def _register_peak_window(mint: str, trade_id: int, entry_price: float, price_so
         "deadline": time.time() + config.PEAK_WINDOW_SECONDS,
         "peak_price": entry_price, "peak_multiple": 1.0,
         "price_source": price_source, "label": label, "suspect_streak": 0,
+        # Same ceiling _is_plausible() uses for closes (tp2_multiple *
+        # MAX_EXIT_MULTIPLE_SANITY_FACTOR) — reused here as a hard,
+        # source-agnostic sanity cap. See _feed_peak_window.
+        "sanity_ceiling": tp2_multiple * config.MAX_EXIT_MULTIPLE_SANITY_FACTOR,
     }
 
 
@@ -213,8 +217,13 @@ async def _feed_peak_window(mint: str, current_price):
     _is_plausible) and needs to repeat 3x before being accepted, so one bad
     reading near a migration boundary can't fake a huge peak.
 
-    Sep 2026 fix: 3 consistent same-feed readings agreeing isn't actually
-    proof they're real — a near-drained pool right after a pump.fun
+    Sep 2026 fix, round 2: added a hard sanity ceiling (see
+    _register_peak_window's sanity_ceiling, reusing MAX_EXIT_MULTIPLE_SANITY_FACTOR)
+    checked before anything else — confirmed necessary after a raydium-sourced
+    window still reported 6601x, since the cross-check below only applies to
+    curve-sourced windows (a raydium window's only data source IS Jupiter, so
+    it can't cross-check against itself). Round 1 fix: 3 consistent same-feed
+    readings agreeing isn't actually proof they're real — a near-drained pool right after a pump.fun
     migration can sit at a corrupted ratio for several ticks in a row,
     which is exactly how a couple of confirmed false readings (911x, 854x)
     got through this filter. So for a curve-sourced (pump.fun) mint, once a
@@ -227,6 +236,18 @@ async def _feed_peak_window(mint: str, current_price):
     if not w or not current_price:
         return
     multiple = current_price / w["entry_price"]
+
+    # Hard ceiling FIRST, before any consistency logic — a persistently bad
+    # feed (a drained/rugged pool reporting a stable, wrong price) will pass
+    # any "needs N consistent reads" test no matter how large N is, since
+    # the bad state doesn't fluctuate. This is the same ceiling _is_plausible()
+    # uses for closes, applied here too. Outright rejected, no streak
+    # counted — a reading this far past a sane ceiling isn't "suspicious,
+    # confirm with more ticks," it's just not real.
+    if multiple > w["sanity_ceiling"]:
+        log.warning(f"[PEAK SANITY REJECTED] {mint} ({w['label']}): reading implies {multiple:.1f}x, past the {w['sanity_ceiling']:.1f}x ceiling for this window — treating as corrupted data (likely a near-drained/rugged pool), not accepting")
+        return
+
     if multiple > w["peak_multiple"] * config.PEAK_WINDOW_MAX_TICK_JUMP:
         w["suspect_streak"] += 1
         if w["suspect_streak"] < 3:
@@ -332,7 +353,7 @@ async def attempt_og_snipe(mint: str, v_sol: float, v_tokens: float, wallet_addr
         "tp2_sell_fraction": tp2_sell_fraction, "tp2_done": False, "runner_trail_pct": runner_trail_pct,
         "entry_tokens_total": fill.tokens_or_sol_received,
     }
-    _register_peak_window(mint, trade_id, fill.effective_price, "curve", watched_wallet_label)
+    _register_peak_window(mint, trade_id, fill.effective_price, "curve", watched_wallet_label, tp2_multiple)
     log.info(f"[OPEN og_wallet] {mint} triggered_by={watched_wallet_label} entry_price={fill.effective_price:.10f} size={buy_size_sol} (tp1={tp1_multiple}x tp2={tp2_multiple}x hold={max_hold_seconds}s)")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, fill.effective_price, buy_size_sol)
     return trade_id
@@ -405,7 +426,7 @@ async def attempt_og_snipe_raydium(mint: str, entry_price_sol: float, wallet_add
         "tp2_sell_fraction": tp2_sell_fraction, "tp2_done": False, "runner_trail_pct": runner_trail_pct,
         "entry_tokens_total": tokens_received,
     }
-    _register_peak_window(mint, trade_id, entry_price_sol, "raydium", watched_wallet_label)
+    _register_peak_window(mint, trade_id, entry_price_sol, "raydium", watched_wallet_label, tp2_multiple)
     log.info(f"[OPEN og_wallet_raydium] {mint} triggered_by={watched_wallet_label} entry_price={entry_price_sol:.10f} size={buy_size_sol} source={source}")
     await telegram_sender.send_trade_open_alert("og_wallet", mint, entry_price_sol, buy_size_sol)
     return trade_id
